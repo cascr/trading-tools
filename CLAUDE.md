@@ -110,6 +110,28 @@ trading-tools/
 4. **Generate Signals** - Identify rich/cheap opportunities
 5. **Visualize** - Charts showing relationships and current positioning
 
+## Workflow Instructions
+
+### Before Leaving Your Computer
+Save and push all changes to GitHub:
+```bash
+git add .
+git commit -m "Describe what you changed"
+git push
+```
+
+### When Switching Locations
+Pull latest changes from GitHub:
+```bash
+git pull
+```
+
+### Office Setup (First Time)
+Clone the repository to get started:
+```bash
+git clone https://github.com/cascr/trading-tools.git
+```
+
 ## Notes for Claude
 
 - Always test code mentally for BQNT compatibility before suggesting
