@@ -1,0 +1,342 @@
+import pandas as pd
+import numpy as np
+import ipywidgets as widgets
+from IPython.display import display, HTML, clear_output
+from datetime import datetime, timedelta
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+from itertools import combinations
+import bqplot as bqp
+from bqplot import pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+
+import bql
+bq = bql.Service()
+HAS_BQL = True
+
+CREDIT_ASSETS = ["CDX IG", "CDX HY", "ITRX MAIN", "ITRX XOVER"]
+EQUITY_ASSETS = ["SPX Index", "NDX Index", "RTY Index", "SX5E Index"]
+DEFAULT_ASSETS = CREDIT_ASSETS + EQUITY_ASSETS
+
+ASSET_TICKERS = {
+    "CDX IG": "CDX IG CDSI GEN 5Y Corp",
+    "CDX HY": "CDX HY CDSI GEN 5Y Corp",
+    "ITRX MAIN": "ITRX EUR CDSI GEN 5Y Corp",
+    "ITRX XOVER": "ITRX XOVER CDSI GEN 5Y Corp",
+    "SPX Index": "SPX Index",
+    "NDX Index": "NDX Index",
+    "RTY Index": "RTY Index",
+    "SX5E Index": "SX5E Index",
+}
+
+COLORS = {
+    "rich": "#e63946",
+    "cheap": "#2a9d8f",
+    "neutral": "#6c757d",
+    "primary": "#264653",
+    "secondary": "#a8dadc",
+    "background": "#f8f9fa"
+}
+
+def load_data_bql(assets, start_date, end_date):
+    tickers = [ASSET_TICKERS.get(a, a) for a in assets]
+    data_item = bq.data.px_last(dates=bq.func.range(start_date, end_date))
+    request = bql.Request(tickers, {"PX_LAST": data_item})
+    response = bq.execute(request)
+    df = response.single().df()
+    df = df.reset_index()
+    df = df.pivot(index="DATE", columns="ID", values="PX_LAST")
+    ticker_to_name = {v: k for k, v in ASSET_TICKERS.items()}
+    df.columns = [ticker_to_name.get(col, col) for col in df.columns]
+    return df.sort_index().dropna()
+
+def calculate_kmo(returns):
+    corr = returns.corr().values
+    try:
+        inv_corr = np.linalg.inv(corr)
+    except:
+        inv_corr = np.linalg.inv(corr + 0.001 * np.eye(len(corr)))
+    diag = np.diag(inv_corr)
+    partial = -inv_corr / np.sqrt(np.outer(diag, diag))
+    np.fill_diagonal(partial, 1.0)
+    r_sq = corr ** 2
+    p_sq = partial ** 2
+    np.fill_diagonal(r_sq, 0)
+    np.fill_diagonal(p_sq, 0)
+    return r_sq.sum() / (r_sq.sum() + p_sq.sum())
+
+def suggest_cohorts(returns, min_size=4, max_size=8, top_n=5):
+    all_assets = list(returns.columns)
+    results = []
+    for size in range(min_size, min(max_size+1, len(all_assets)+1)):
+        for combo in combinations(all_assets, size):
+            assets = list(combo)
+            n_credit = sum(1 for a in assets if a in CREDIT_ASSETS)
+            n_equity = len(assets) - n_credit
+            if n_credit >= 2 and n_equity >= 2:
+                kmo = calculate_kmo(returns[assets])
+                results.append({"assets": assets, "size": size, "kmo": kmo, "credit": n_credit, "equity": n_equity})
+    results.sort(key=lambda x: x["kmo"], reverse=True)
+    return results[:top_n]
+
+def run_validation_tests(returns):
+    results = {}
+    kmo = calculate_kmo(returns)
+    results["KMO"] = {"value": kmo, "status": "PASS" if kmo >= 0.8 else "WARN" if kmo >= 0.6 else "FAIL"}
+    corr = returns.corr()
+    mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
+    avg_corr = corr.where(mask).stack().abs().mean()
+    results["Correlation"] = {"value": avg_corr, "status": "PASS" if avg_corr >= 0.3 else "FAIL"}
+    results["corr_matrix"] = corr
+    window = 60
+    assets = returns.columns.tolist()
+    stds = []
+    for i in range(len(assets)):
+        for j in range(i+1, len(assets)):
+            roll_corr = returns[assets[i]].rolling(window=window).corr(returns[assets[j]]).dropna()
+            stds.append(roll_corr.std())
+    avg_std = np.mean(stds)
+    results["Stability"] = {"value": avg_std, "status": "PASS" if avg_std < 0.2 else "WARN" if avg_std < 0.4 else "FAIL"}
+    lag_corrs = []
+    for i in range(len(assets)):
+        for j in range(len(assets)):
+            if i != j:
+                lag_corr = returns[assets[i]].shift(1).corr(returns[assets[j]])
+                lag_corrs.append(abs(lag_corr))
+    avg_lag = np.mean(lag_corrs)
+    results["LeadLag"] = {"value": avg_lag, "status": "PASS" if avg_lag < 0.1 else "WARN"}
+    dist = 1 - corr.abs()
+    condensed = squareform(dist.values)
+    linkage_matrix = linkage(condensed, method="ward")
+    labels = fcluster(linkage_matrix, t=linkage_matrix[:, 2].max() * 0.5, criterion="distance")
+    n_clusters = len(set(labels))
+    results["Clustering"] = {"value": n_clusters, "status": "PASS" if 2 <= n_clusters <= 4 else "WARN"}
+    return results
+
+def run_pca_analysis(returns, num_pcs=1):
+    credit = [a for a in returns.columns if a in CREDIT_ASSETS]
+    equity = [a for a in returns.columns if a in EQUITY_ASSETS]
+    scaler = StandardScaler()
+    data_scaled = scaler.fit_transform(returns)
+    pca = PCA()
+    pca_scores = pca.fit_transform(data_scaled)
+    loadings = pd.DataFrame(pca.components_.T, columns=[f"PC{i+1}" for i in range(len(returns.columns))], index=returns.columns)
+    var_explained = pd.Series(pca.explained_variance_ratio_, index=[f"PC{i+1}" for i in range(len(returns.columns))])
+    expected = np.zeros_like(data_scaled)
+    for i in range(num_pcs):
+        beta = loadings[f"PC{i+1}"].values
+        expected += np.outer(pca_scores[:, i], beta)
+    residuals = data_scaled - expected
+    z_scores = pd.DataFrame((residuals - residuals.mean(axis=0)) / residuals.std(axis=0), index=returns.index, columns=returns.columns)
+    for asset in credit:
+        if asset in z_scores.columns:
+            z_scores[asset] = -z_scores[asset]
+    return {"z_scores": z_scores, "loadings": loadings, "variance": var_explained, "credit": credit, "equity": equity}
+
+def get_ranking(z_scores, credit, as_of_date=None):
+    if as_of_date is None:
+        as_of_date = z_scores.index[-1]
+    z_row = z_scores.loc[as_of_date]
+    ranking = []
+    for asset in z_scores.columns:
+        z = z_row[asset]
+        if abs(z) >= 2:
+            signal = "VERY RICH" if z > 0 else "VERY CHEAP"
+        elif abs(z) >= 1:
+            signal = "Rich" if z > 0 else "Cheap"
+        else:
+            signal = "Fair"
+        ranking.append({"Asset": asset, "Type": "Credit" if asset in credit else "Equity", "Z-Score": z, "Signal": signal})
+    df = pd.DataFrame(ranking).sort_values("Z-Score", ascending=False)
+    df["Rank"] = range(1, len(df) + 1)
+    return df[["Rank", "Asset", "Type", "Z-Score", "Signal"]]
+
+def get_rv_opportunities(ranking):
+    opps = {}
+    for asset_type in ["Credit", "Equity"]:
+        subset = ranking[ranking["Type"] == asset_type].sort_values("Z-Score", ascending=False)
+        if len(subset) >= 2:
+            rich = subset.iloc[0]
+            cheap = subset.iloc[-1]
+            opps[f"{asset_type} RV"] = {"Short": rich["Asset"], "Short Z": rich["Z-Score"], "Long": cheap["Asset"], "Long Z": cheap["Z-Score"], "Spread": rich["Z-Score"] - cheap["Z-Score"]}
+    return opps
+
+def create_zscore_timeseries(z_scores, assets, title="Z-Score Time Series"):
+    dates = z_scores.index.tolist()
+    x_scale = bqp.DateScale()
+    y_scale = bqp.LinearScale(min=-4, max=4)
+    lines = []
+    colors = ["#264653", "#2a9d8f", "#e9c46a", "#f4a261", "#e63946", "#a8dadc", "#457b9d", "#1d3557"]
+    for i, asset in enumerate(assets):
+        line = bqp.Lines(x=dates, y=z_scores[asset].values, scales={'x': x_scale, 'y': y_scale}, colors=[colors[i % len(colors)]], labels=[asset], display_legend=True)
+        lines.append(line)
+    rich_line = bqp.Lines(x=[dates[0], dates[-1]], y=[2, 2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["rich"]], line_style="dashed", opacities=[0.5])
+    cheap_line = bqp.Lines(x=[dates[0], dates[-1]], y=[-2, -2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["cheap"]], line_style="dashed", opacities=[0.5])
+    zero_line = bqp.Lines(x=[dates[0], dates[-1]], y=[0, 0], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted", opacities=[0.3])
+    x_axis = bqp.Axis(scale=x_scale, grid_lines="none")
+    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", grid_lines="solid", grid_color="#e0e0e0", label="Z-Score")
+    fig = bqp.Figure(marks=lines + [rich_line, cheap_line, zero_line], axes=[x_axis, y_axis], title=title, legend_location="top-left", fig_margin={"top": 60, "bottom": 40, "left": 60, "right": 20}, background_style={"fill": COLORS["background"]})
+    fig.layout.width = "800px"
+    fig.layout.height = "350px"
+    return fig
+
+def create_pair_scatter(z_scores, asset1, asset2, lookback=252):
+    recent = z_scores.iloc[-lookback:]
+    x_data = recent[asset1].values
+    y_data = recent[asset2].values
+    x_scale = bqp.LinearScale(min=-4, max=4)
+    y_scale = bqp.LinearScale(min=-4, max=4)
+    colors = np.linspace(0.2, 1, len(x_data))
+    color_scale = bqp.ColorScale(colors=["#a8dadc", "#264653"])
+    scatter = bqp.Scatter(x=x_data, y=y_data, scales={'x': x_scale, 'y': y_scale, 'color': color_scale}, color=colors, default_size=20, opacities=[0.7]*len(x_data))
+    current = bqp.Scatter(x=[x_data[-1]], y=[y_data[-1]], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["rich"]], default_size=100, marker="diamond")
+    h_line = bqp.Lines(x=[-4, 4], y=[0, 0], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted")
+    v_line = bqp.Lines(x=[0, 0], y=[-4, 4], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted")
+    x_axis = bqp.Axis(scale=x_scale, label=f"{asset1} Z-Score", grid_lines="none")
+    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label=f"{asset2} Z-Score", grid_lines="none")
+    fig = bqp.Figure(marks=[scatter, current, h_line, v_line], axes=[x_axis, y_axis], title=f"{asset1} vs {asset2} (last {lookback} days)", fig_margin={"top": 50, "bottom": 50, "left": 60, "right": 20}, background_style={"fill": COLORS["background"]})
+    fig.layout.width = "450px"
+    fig.layout.height = "400px"
+    return fig
+
+def create_spread_timeseries(z_scores, asset1, asset2, lookback=252):
+    recent = z_scores.iloc[-lookback:]
+    spread = recent[asset1] - recent[asset2]
+    dates = recent.index.tolist()
+    x_scale = bqp.DateScale()
+    y_scale = bqp.LinearScale()
+    line = bqp.Lines(x=dates, y=spread.values, scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["primary"]])
+    zero_line = bqp.Lines(x=[dates[0], dates[-1]], y=[0, 0], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted")
+    x_axis = bqp.Axis(scale=x_scale, grid_lines="none")
+    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label="Spread (Z)", grid_lines="solid", grid_color="#e0e0e0")
+    fig = bqp.Figure(marks=[line, zero_line], axes=[x_axis, y_axis], title=f"Z-Spread: {asset1} minus {asset2}", fig_margin={"top": 50, "bottom": 40, "left": 60, "right": 20}, background_style={"fill": COLORS["background"]})
+    fig.layout.width = "800px"
+    fig.layout.height = "250px"
+    return fig
+
+class AppState:
+    def __init__(self):
+        self.raw_data = None
+        self.returns = None
+        self.pca_results = None
+        self.test_results = None
+        self.suggested_cohorts = None
+
+state = AppState()
+
+asset_select = widgets.SelectMultiple(options=list(ASSET_TICKERS.keys()), value=tuple(DEFAULT_ASSETS), rows=8, layout=widgets.Layout(width="300px"))
+start_date = widgets.DatePicker(value=(datetime.now() - timedelta(days=365*5)).date())
+end_date = widgets.DatePicker(value=datetime.now().date())
+load_btn = widgets.Button(description="Load Data", button_style="primary")
+data_output = widgets.Output()
+
+run_tests_btn = widgets.Button(description="Run Validation", button_style="primary")
+suggest_btn = widgets.Button(description="Suggest Cohorts", button_style="info")
+tests_output = widgets.Output()
+cohort_output = widgets.Output()
+
+num_pcs = widgets.IntSlider(value=1, min=1, max=5, description="PCs:")
+run_pca_btn = widgets.Button(description="Run PCA", button_style="primary")
+pca_output = widgets.Output()
+
+results_output = widgets.Output()
+chart_output = widgets.Output()
+
+pair_asset1 = widgets.Dropdown(options=list(ASSET_TICKERS.keys()), value="SPX Index", description="Asset 1:")
+pair_asset2 = widgets.Dropdown(options=list(ASSET_TICKERS.keys()), value="CDX HY", description="Asset 2:")
+pair_btn = widgets.Button(description="Show Relationship", button_style="info")
+pair_output = widgets.Output()
+
+def on_load(b):
+    with data_output:
+        clear_output(wait=True)
+        assets = list(asset_select.value)
+        if len(assets) < 3:
+            print("Select at least 3 assets")
+            return
+        state.raw_data = load_data_bql(assets, start_date.value.strftime("%Y-%m-%d"), end_date.value.strftime("%Y-%m-%d"))
+        state.returns = state.raw_data.pct_change().dropna()
+        print(f"Loaded {len(state.returns)} days for {len(assets)} assets")
+        pair_asset1.options = assets
+        pair_asset2.options = assets
+
+def on_run_tests(b):
+    with tests_output:
+        clear_output(wait=True)
+        if state.returns is None:
+            print("Load data first")
+            return
+        state.test_results = run_validation_tests(state.returns)
+        for test, result in state.test_results.items():
+            if test == "corr_matrix":
+                continue
+            color = "#2a9d8f" if result["status"] == "PASS" else "#e63946" if result["status"] == "FAIL" else "#f4a261"
+            display(HTML(f"<span style='color:{color};font-weight:bold;'>{test}: {result['value']:.3f} [{result['status']}]</span>"))
+
+def on_suggest(b):
+    with cohort_output:
+        clear_output(wait=True)
+        if state.returns is None:
+            print("Load data first")
+            return
+        print("Finding optimal cohorts...")
+        state.suggested_cohorts = suggest_cohorts(state.returns)
+        for i, c in enumerate(state.suggested_cohorts):
+            display(HTML(f"<b>Option {i+1}:</b> KMO={c['kmo']:.3f} | {c['credit']}C/{c['equity']}E | {', '.join(c['assets'])}"))
+
+def on_run_pca(b):
+    with pca_output:
+        clear_output(wait=True)
+        if state.returns is None:
+            print("Load data first")
+            return
+        state.pca_results = run_pca_analysis(state.returns, num_pcs=num_pcs.value)
+        var = state.pca_results["variance"]
+        print(f"PC1: {var.iloc[0]:.1%} | PC2: {var.iloc[1]:.1%} | PC3: {var.iloc[2]:.1%}")
+    with results_output:
+        clear_output(wait=True)
+        z = state.pca_results["z_scores"]
+        ranking = get_ranking(z, state.pca_results["credit"])
+        display(ranking)
+        opps = get_rv_opportunities(ranking)
+        for trade, d in opps.items():
+            display(HTML(f"<b>{trade}:</b> Short {d['Short']} ({d['Short Z']:+.2f}) / Long {d['Long']} ({d['Long Z']:+.2f}) | Spread: {d['Spread']:.2f}"))
+    with chart_output:
+        clear_output(wait=True)
+        fig = create_zscore_timeseries(z.iloc[-252:], list(z.columns))
+        display(fig)
+
+def on_pair(b):
+    with pair_output:
+        clear_output(wait=True)
+        if state.pca_results is None:
+            print("Run PCA first")
+            return
+        z = state.pca_results["z_scores"]
+        a1, a2 = pair_asset1.value, pair_asset2.value
+        scatter = create_pair_scatter(z, a1, a2)
+        spread = create_spread_timeseries(z, a1, a2)
+        display(widgets.VBox([scatter, spread]))
+
+load_btn.on_click(on_load)
+run_tests_btn.on_click(on_run_tests)
+suggest_btn.on_click(on_suggest)
+run_pca_btn.on_click(on_run_pca)
+pair_btn.on_click(on_pair)
+
+tab1 = widgets.VBox([widgets.HTML("<h3>Data</h3>"), asset_select, widgets.HBox([start_date, end_date]), load_btn, data_output])
+tab2 = widgets.VBox([widgets.HTML("<h3>Validation</h3>"), run_tests_btn, tests_output, widgets.HTML("<br>"), suggest_btn, cohort_output])
+tab3 = widgets.VBox([widgets.HTML("<h3>PCA</h3>"), num_pcs, run_pca_btn, pca_output, widgets.HTML("<h4>Rankings</h4>"), results_output])
+tab4 = widgets.VBox([widgets.HTML("<h3>Charts</h3>"), chart_output, widgets.HTML("<h4>Pair Analysis</h4>"), widgets.HBox([pair_asset1, pair_asset2, pair_btn]), pair_output])
+
+tabs = widgets.Tab(children=[tab1, tab2, tab3, tab4])
+tabs.set_title(0, "Data")
+tabs.set_title(1, "Validation")
+tabs.set_title(2, "PCA")
+tabs.set_title(3, "Charts")
+
+display(HTML("<h2 style='color:#264653;'>PCA Rich/Cheap Analysis</h2>"))
+display(tabs)
