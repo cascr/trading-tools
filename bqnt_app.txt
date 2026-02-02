@@ -21,31 +21,21 @@ CREDIT_ASSETS = ["CDX IG", "CDX HY", "ITRX MAIN", "ITRX XOVER"]
 EQUITY_ASSETS = ["SPX Index", "NDX Index", "RTY Index", "SX5E Index"]
 DEFAULT_ASSETS = CREDIT_ASSETS + EQUITY_ASSETS
 
-ASSET_TICKERS = {
-    "CDX IG": "CDX IG CDSI GEN 5Y Corp",
-    "CDX HY": "CDX HY CDSI GEN 5Y Corp",
-    "ITRX MAIN": "ITRX EUR CDSI GEN 5Y Corp",
-    "ITRX XOVER": "ITRX XOVER CDSI GEN 5Y Corp",
-    "SPX Index": "SPX Index",
-    "NDX Index": "NDX Index",
-    "RTY Index": "RTY Index",
-    "SX5E Index": "SX5E Index",
-}
+ASSET_TICKERS = {"CDX IG": "CDX IG CDSI GEN 5Y Corp", "CDX HY": "CDX HY CDSI GEN 5Y Corp", "ITRX MAIN": "ITRX EUR CDSI GEN 5Y Corp", "ITRX XOVER": "ITRX XOVER CDSI GEN 5Y Corp", "SPX Index": "SPX Index", "NDX Index": "NDX Index", "RTY Index": "RTY Index", "SX5E Index": "SX5E Index"}
 
-FIELD_OPTIONS = {
-    "PX_LAST": "Last Price",
-    "PY026": "Roll Adjusted Mid Price",
-}
+FIELD_OPTIONS = {"PX_LAST": "Last Price", "PY026": "Roll Adjusted Mid Price"}
 
-COLORS = {
-    "rich": "#e63946",
-    "cheap": "#2a9d8f",
-    "neutral": "#6c757d",
-    "primary": "#264653",
-    "secondary": "#a8dadc",
-    "background": "#f8f9fa",
-    "threshold": "#dee2e6"
-}
+COLORS = {"rich": "#e63946", "cheap": "#2a9d8f", "neutral": "#6c757d", "primary": "#264653", "secondary": "#a8dadc", "background": "#f8f9fa", "threshold": "#dee2e6"}
+
+class AppState: pass
+state = AppState()
+state.raw_data = None
+state.returns = None
+state.pca_results = None
+state.test_results = None
+state.suggested_cohorts = None
+state.selected_assets = []
+state.field_map = {}
 
 def load_data_bql(assets, field_map, start_date, end_date):
     all_dfs = []
@@ -132,18 +122,21 @@ def run_validation_tests(returns):
 def run_pca_analysis(returns, num_pcs=1):
     credit = [a for a in returns.columns if a in CREDIT_ASSETS]
     equity = [a for a in returns.columns if a in EQUITY_ASSETS]
+    clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(clean_returns) < 30:
+        raise ValueError(f"Not enough clean data: {len(clean_returns)} rows after removing inf/NaN")
     scaler = StandardScaler()
-    data_scaled = scaler.fit_transform(returns)
+    data_scaled = scaler.fit_transform(clean_returns)
     pca = PCA()
     pca_scores = pca.fit_transform(data_scaled)
-    loadings = pd.DataFrame(pca.components_.T, columns=[f"PC{i+1}" for i in range(len(returns.columns))], index=returns.columns)
-    var_explained = pd.Series(pca.explained_variance_ratio_, index=[f"PC{i+1}" for i in range(len(returns.columns))])
+    loadings = pd.DataFrame(pca.components_.T, columns=[f"PC{i+1}" for i in range(len(clean_returns.columns))], index=clean_returns.columns)
+    var_explained = pd.Series(pca.explained_variance_ratio_, index=[f"PC{i+1}" for i in range(len(clean_returns.columns))])
     expected = np.zeros_like(data_scaled)
     for i in range(num_pcs):
         beta = loadings[f"PC{i+1}"].values
         expected += np.outer(pca_scores[:, i], beta)
     residuals = data_scaled - expected
-    z_scores = pd.DataFrame((residuals - residuals.mean(axis=0)) / residuals.std(axis=0), index=returns.index, columns=returns.columns)
+    z_scores = pd.DataFrame((residuals - residuals.mean(axis=0)) / residuals.std(axis=0), index=clean_returns.index, columns=clean_returns.columns)
     for asset in credit:
         if asset in z_scores.columns:
             z_scores[asset] = -z_scores[asset]
@@ -265,18 +258,6 @@ def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756):
     fig.layout.height = "280px"
     return fig
 
-class AppState:
-    def __init__(self):
-        self.raw_data = None
-        self.returns = None
-        self.pca_results = None
-        self.test_results = None
-        self.suggested_cohorts = None
-        self.selected_assets = []
-        self.field_map = {}
-
-state = AppState()
-
 available_list = widgets.Select(options=list(ASSET_TICKERS.keys()), rows=8, layout=widgets.Layout(width="200px"))
 selected_list = widgets.Select(options=[], rows=8, layout=widgets.Layout(width="200px"))
 field_select = widgets.Dropdown(options=list(FIELD_OPTIONS.keys()), value="PX_LAST", description="Field:", layout=widgets.Layout(width="200px"))
@@ -286,17 +267,14 @@ start_date = widgets.DatePicker(value=(datetime.now() - timedelta(days=365*5)).d
 end_date = widgets.DatePicker(value=datetime.now().date())
 load_btn = widgets.Button(description="Load Data", button_style="primary")
 data_output = widgets.Output()
-
 run_tests_btn = widgets.Button(description="Run Validation", button_style="primary")
 suggest_btn = widgets.Button(description="Suggest Cohorts", button_style="info")
 tests_output = widgets.Output()
 cohort_output = widgets.Output()
-
 num_pcs = widgets.IntSlider(value=1, min=1, max=5, description="PCs:")
 run_pca_btn = widgets.Button(description="Run PCA", button_style="primary")
 pca_output = widgets.Output()
 results_output = widgets.Output()
-
 pair_asset1 = widgets.Dropdown(options=[], description="Asset 1:", layout=widgets.Layout(width="200px"))
 pair_asset2 = widgets.Dropdown(options=[], description="Asset 2:", layout=widgets.Layout(width="200px"))
 pair_btn = widgets.Button(description="Analyze Pair", button_style="primary")
@@ -332,7 +310,13 @@ def on_load(b):
             print("Add at least 3 assets")
             return
         state.raw_data = load_data_bql(state.selected_assets, state.field_map, start_date.value.strftime("%Y-%m-%d"), end_date.value.strftime("%Y-%m-%d"))
-        state.returns = state.raw_data.pct_change().dropna()
+        returns_list = []
+        for col in state.raw_data.columns:
+            if col in CREDIT_ASSETS:
+                returns_list.append(state.raw_data[col].diff())
+            else:
+                returns_list.append(state.raw_data[col].pct_change() * 100)
+        state.returns = pd.concat(returns_list, axis=1).dropna()
         print(f"Loaded {len(state.returns)} days for {len(state.selected_assets)} assets")
         pair_asset1.options = state.selected_assets
         pair_asset2.options = state.selected_assets
@@ -414,49 +398,14 @@ for asset in DEFAULT_ASSETS:
     state.field_map[asset] = "PX_LAST"
 update_selected_display()
 
-data_controls = widgets.VBox([
-    widgets.HTML("<b>Available</b>"),
-    available_list,
-    widgets.HBox([widgets.Label("Field:"), field_select]),
-])
-selected_controls = widgets.VBox([
-    widgets.HTML("<b>Selected Cohort</b>"),
-    selected_list,
-])
+data_controls = widgets.VBox([widgets.HTML("<b>Available</b>"), available_list, widgets.HBox([widgets.Label("Field:"), field_select])])
+selected_controls = widgets.VBox([widgets.HTML("<b>Selected Cohort</b>"), selected_list])
 button_controls = widgets.VBox([add_btn, remove_btn], layout=widgets.Layout(justify_content="center", margin="40px 10px"))
 
-tab1 = widgets.VBox([
-    widgets.HTML("<h3>Data Selection</h3>"),
-    widgets.HBox([data_controls, button_controls, selected_controls]),
-    widgets.HTML("<br>"),
-    widgets.HBox([widgets.Label("Start:"), start_date, widgets.Label("End:"), end_date]),
-    load_btn,
-    data_output
-])
-
-tab2 = widgets.VBox([
-    widgets.HTML("<h3>Validation</h3>"),
-    run_tests_btn,
-    tests_output,
-    widgets.HTML("<br>"),
-    suggest_btn,
-    cohort_output
-])
-
-tab3 = widgets.VBox([
-    widgets.HTML("<h3>PCA Analysis</h3>"),
-    num_pcs,
-    run_pca_btn,
-    pca_output,
-    widgets.HTML("<h4>Rankings</h4>"),
-    results_output
-])
-
-tab4 = widgets.VBox([
-    widgets.HTML("<h3>Pair Analysis</h3>"),
-    widgets.HBox([pair_asset1, pair_asset2, pair_btn]),
-    chart_output
-])
+tab1 = widgets.VBox([widgets.HTML("<h3>Data Selection</h3>"), widgets.HBox([data_controls, button_controls, selected_controls]), widgets.HTML("<br>"), widgets.HBox([widgets.Label("Start:"), start_date, widgets.Label("End:"), end_date]), load_btn, data_output])
+tab2 = widgets.VBox([widgets.HTML("<h3>Validation</h3>"), run_tests_btn, tests_output, widgets.HTML("<br>"), suggest_btn, cohort_output])
+tab3 = widgets.VBox([widgets.HTML("<h3>PCA Analysis</h3>"), num_pcs, run_pca_btn, pca_output, widgets.HTML("<h4>Rankings</h4>"), results_output])
+tab4 = widgets.VBox([widgets.HTML("<h3>Pair Analysis</h3>"), widgets.HBox([pair_asset1, pair_asset2, pair_btn]), chart_output])
 
 tabs = widgets.Tab(children=[tab1, tab2, tab3, tab4])
 tabs.set_title(0, "Data")
