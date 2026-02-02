@@ -5,17 +5,17 @@ from IPython.display import display, HTML, clear_output
 from datetime import datetime, timedelta
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from sklearn.kernel_ridge import KernelRidge
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
+from scipy import stats
 from itertools import combinations
 import bqplot as bqp
-from bqplot import pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
 
 import bql
 bq = bql.Service()
-HAS_BQL = True
 
 CREDIT_ASSETS = ["CDX IG", "CDX HY", "ITRX MAIN", "ITRX XOVER"]
 EQUITY_ASSETS = ["SPX Index", "NDX Index", "RTY Index", "SX5E Index"]
@@ -32,26 +32,39 @@ ASSET_TICKERS = {
     "SX5E Index": "SX5E Index",
 }
 
+FIELD_OPTIONS = {
+    "PX_LAST": "Last Price",
+    "PY026": "Roll Adjusted Mid Price",
+}
+
 COLORS = {
     "rich": "#e63946",
     "cheap": "#2a9d8f",
     "neutral": "#6c757d",
     "primary": "#264653",
     "secondary": "#a8dadc",
-    "background": "#f8f9fa"
+    "background": "#f8f9fa",
+    "threshold": "#dee2e6"
 }
 
-def load_data_bql(assets, start_date, end_date):
-    tickers = [ASSET_TICKERS.get(a, a) for a in assets]
-    data_item = bq.data.px_last(dates=bq.func.range(start_date, end_date))
-    request = bql.Request(tickers, {"PX_LAST": data_item})
-    response = bq.execute(request)
-    df = response.single().df()
-    df = df.reset_index()
-    df = df.pivot(index="DATE", columns="ID", values="PX_LAST")
-    ticker_to_name = {v: k for k, v in ASSET_TICKERS.items()}
-    df.columns = [ticker_to_name.get(col, col) for col in df.columns]
-    return df.sort_index().dropna()
+def load_data_bql(assets, field_map, start_date, end_date):
+    all_dfs = []
+    for asset in assets:
+        ticker = ASSET_TICKERS.get(asset, asset)
+        field = field_map.get(asset, "PX_LAST")
+        if field == "PX_LAST":
+            data_item = bq.data.px_last(dates=bq.func.range(start_date, end_date))
+        else:
+            data_item = bq.data.py026(dates=bq.func.range(start_date, end_date))
+        request = bql.Request(ticker, {"VALUE": data_item})
+        response = bq.execute(request)
+        df = response.single().df()
+        df = df.reset_index()
+        df = df[["DATE", "VALUE"]].rename(columns={"VALUE": asset})
+        df = df.set_index("DATE")
+        all_dfs.append(df)
+    result = pd.concat(all_dfs, axis=1)
+    return result.sort_index().dropna()
 
 def calculate_kmo(returns):
     corr = returns.corr().values
@@ -164,26 +177,51 @@ def get_rv_opportunities(ranking):
             opps[f"{asset_type} RV"] = {"Short": rich["Asset"], "Short Z": rich["Z-Score"], "Long": cheap["Asset"], "Long Z": cheap["Z-Score"], "Spread": rich["Z-Score"] - cheap["Z-Score"]}
     return opps
 
-def create_zscore_timeseries(z_scores, assets, title="Z-Score Time Series"):
-    dates = z_scores.index.tolist()
-    x_scale = bqp.DateScale()
-    y_scale = bqp.LinearScale(min=-4, max=4)
-    lines = []
-    colors = ["#264653", "#2a9d8f", "#e9c46a", "#f4a261", "#e63946", "#a8dadc", "#457b9d", "#1d3557"]
-    for i, asset in enumerate(assets):
-        line = bqp.Lines(x=dates, y=z_scores[asset].values, scales={'x': x_scale, 'y': y_scale}, colors=[colors[i % len(colors)]], labels=[asset], display_legend=True)
-        lines.append(line)
-    rich_line = bqp.Lines(x=[dates[0], dates[-1]], y=[2, 2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["rich"]], line_style="dashed", opacities=[0.5])
-    cheap_line = bqp.Lines(x=[dates[0], dates[-1]], y=[-2, -2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["cheap"]], line_style="dashed", opacities=[0.5])
-    zero_line = bqp.Lines(x=[dates[0], dates[-1]], y=[0, 0], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted", opacities=[0.3])
-    x_axis = bqp.Axis(scale=x_scale, grid_lines="none")
-    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", grid_lines="solid", grid_color="#e0e0e0", label="Z-Score")
-    fig = bqp.Figure(marks=lines + [rich_line, cheap_line, zero_line], axes=[x_axis, y_axis], title=title, legend_location="top-left", fig_margin={"top": 60, "bottom": 40, "left": 60, "right": 20}, background_style={"fill": COLORS["background"]})
-    fig.layout.width = "800px"
-    fig.layout.height = "350px"
-    return fig
+def get_changes(raw_data, asset):
+    if asset in CREDIT_ASSETS:
+        return raw_data[asset].diff().dropna()
+    else:
+        return raw_data[asset].pct_change().dropna() * 100
 
-def create_pair_scatter(z_scores, asset1, asset2, lookback=252):
+def create_kernel_regression_chart(raw_data, asset1, asset2, lookback=756):
+    recent = raw_data.iloc[-lookback:]
+    x_changes = get_changes(recent, asset1).values
+    y_changes = get_changes(recent, asset2).values
+    min_len = min(len(x_changes), len(y_changes))
+    x_changes = x_changes[-min_len:]
+    y_changes = y_changes[-min_len:]
+    mask = ~(np.isnan(x_changes) | np.isnan(y_changes))
+    x_clean = x_changes[mask]
+    y_clean = y_changes[mask]
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x_clean, y_clean)
+    beta = slope
+    r_squared = r_value ** 2
+    kr = KernelRidge(alpha=1.0, kernel='rbf', gamma=0.1)
+    X_fit = x_clean.reshape(-1, 1)
+    kr.fit(X_fit, y_clean)
+    x_sorted_idx = np.argsort(x_clean)
+    x_sorted = x_clean[x_sorted_idx]
+    y_kr = kr.predict(x_sorted.reshape(-1, 1))
+    x_scale = bqp.LinearScale()
+    y_scale = bqp.LinearScale()
+    colors = np.linspace(0.2, 1, len(x_clean))
+    color_scale = bqp.ColorScale(colors=["#a8dadc", "#264653"])
+    scatter = bqp.Scatter(x=x_clean, y=y_clean, scales={'x': x_scale, 'y': y_scale, 'color': color_scale}, color=colors, default_size=15, opacities=[0.6]*len(x_clean))
+    kr_line = bqp.Lines(x=x_sorted, y=y_kr, scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["rich"]], stroke_width=3)
+    lin_y = intercept + slope * x_sorted
+    lin_line = bqp.Lines(x=x_sorted, y=lin_y, scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["primary"]], stroke_width=2, line_style="dashed")
+    x_label = f"{asset1} {'Spread Chg (bps)' if asset1 in CREDIT_ASSETS else '% Chg'}"
+    y_label = f"{asset2} {'Spread Chg (bps)' if asset2 in CREDIT_ASSETS else '% Chg'}"
+    x_axis = bqp.Axis(scale=x_scale, label=x_label, grid_lines="none")
+    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label=y_label, grid_lines="none")
+    tooltip = bqp.Tooltip(fields=['x', 'y'], formats=['.2f', '.2f'])
+    scatter.tooltip = tooltip
+    fig = bqp.Figure(marks=[scatter, kr_line, lin_line], axes=[x_axis, y_axis], title=f"Kernel Regression: {asset1} vs {asset2}", fig_margin={"top": 50, "bottom": 60, "left": 70, "right": 20}, background_style={"fill": COLORS["background"]})
+    fig.layout.width = "500px"
+    fig.layout.height = "400px"
+    return fig, beta, r_squared
+
+def create_zscore_scatter(z_scores, asset1, asset2, lookback=756):
     recent = z_scores.iloc[-lookback:]
     x_data = recent[asset1].values
     y_data = recent[asset2].values
@@ -191,30 +229,40 @@ def create_pair_scatter(z_scores, asset1, asset2, lookback=252):
     y_scale = bqp.LinearScale(min=-4, max=4)
     colors = np.linspace(0.2, 1, len(x_data))
     color_scale = bqp.ColorScale(colors=["#a8dadc", "#264653"])
-    scatter = bqp.Scatter(x=x_data, y=y_data, scales={'x': x_scale, 'y': y_scale, 'color': color_scale}, color=colors, default_size=20, opacities=[0.7]*len(x_data))
-    current = bqp.Scatter(x=[x_data[-1]], y=[y_data[-1]], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["rich"]], default_size=100, marker="diamond")
-    h_line = bqp.Lines(x=[-4, 4], y=[0, 0], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted")
-    v_line = bqp.Lines(x=[0, 0], y=[-4, 4], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted")
+    scatter = bqp.Scatter(x=x_data, y=y_data, scales={'x': x_scale, 'y': y_scale, 'color': color_scale}, color=colors, default_size=15, opacities=[0.6]*len(x_data))
+    current = bqp.Scatter(x=[x_data[-1]], y=[y_data[-1]], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["rich"]], default_size=80, marker="diamond")
+    h_line = bqp.Lines(x=[-4, 4], y=[0, 0], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted", opacities=[0.5])
+    v_line = bqp.Lines(x=[0, 0], y=[-4, 4], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted", opacities=[0.5])
+    h2_pos = bqp.Lines(x=[-4, 4], y=[2, 2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
+    h2_neg = bqp.Lines(x=[-4, 4], y=[-2, -2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
+    v2_pos = bqp.Lines(x=[2, 2], y=[-4, 4], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
+    v2_neg = bqp.Lines(x=[-2, -2], y=[-4, 4], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
     x_axis = bqp.Axis(scale=x_scale, label=f"{asset1} Z-Score", grid_lines="none")
     y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label=f"{asset2} Z-Score", grid_lines="none")
-    fig = bqp.Figure(marks=[scatter, current, h_line, v_line], axes=[x_axis, y_axis], title=f"{asset1} vs {asset2} (last {lookback} days)", fig_margin={"top": 50, "bottom": 50, "left": 60, "right": 20}, background_style={"fill": COLORS["background"]})
+    tooltip = bqp.Tooltip(fields=['x', 'y'], formats=['.2f', '.2f'])
+    scatter.tooltip = tooltip
+    current.tooltip = bqp.Tooltip(fields=['x', 'y'], formats=['.2f', '.2f'], labels=['Current X', 'Current Y'])
+    fig = bqp.Figure(marks=[h2_pos, h2_neg, v2_pos, v2_neg, h_line, v_line, scatter, current], axes=[x_axis, y_axis], title=f"Z-Score: {asset1} vs {asset2}", fig_margin={"top": 50, "bottom": 60, "left": 70, "right": 20}, background_style={"fill": COLORS["background"]})
     fig.layout.width = "450px"
     fig.layout.height = "400px"
     return fig
 
-def create_spread_timeseries(z_scores, asset1, asset2, lookback=252):
+def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756):
     recent = z_scores.iloc[-lookback:]
     spread = recent[asset1] - recent[asset2]
     dates = recent.index.tolist()
     x_scale = bqp.DateScale()
     y_scale = bqp.LinearScale()
-    line = bqp.Lines(x=dates, y=spread.values, scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["primary"]])
-    zero_line = bqp.Lines(x=[dates[0], dates[-1]], y=[0, 0], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted")
+    line = bqp.Lines(x=dates, y=spread.values, scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["primary"]], stroke_width=1.5)
+    zero_line = bqp.Lines(x=[dates[0], dates[-1]], y=[0, 0], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted", opacities=[0.5])
+    pos2_line = bqp.Lines(x=[dates[0], dates[-1]], y=[2, 2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
+    neg2_line = bqp.Lines(x=[dates[0], dates[-1]], y=[-2, -2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
     x_axis = bqp.Axis(scale=x_scale, grid_lines="none")
-    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label="Spread (Z)", grid_lines="solid", grid_color="#e0e0e0")
-    fig = bqp.Figure(marks=[line, zero_line], axes=[x_axis, y_axis], title=f"Z-Spread: {asset1} minus {asset2}", fig_margin={"top": 50, "bottom": 40, "left": 60, "right": 20}, background_style={"fill": COLORS["background"]})
-    fig.layout.width = "800px"
-    fig.layout.height = "250px"
+    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label="Z-Score Spread", grid_lines="solid", grid_color="#e0e0e0")
+    index_sel = bqp.interacts.IndexSelector(scale=x_scale, marks=[line])
+    fig = bqp.Figure(marks=[pos2_line, neg2_line, zero_line, line], axes=[x_axis, y_axis], title=f"Z-Score Spread: {asset1} minus {asset2}", fig_margin={"top": 50, "bottom": 40, "left": 70, "right": 20}, background_style={"fill": COLORS["background"]}, interaction=index_sel)
+    fig.layout.width = "100%"
+    fig.layout.height = "280px"
     return fig
 
 class AppState:
@@ -224,10 +272,16 @@ class AppState:
         self.pca_results = None
         self.test_results = None
         self.suggested_cohorts = None
+        self.selected_assets = []
+        self.field_map = {}
 
 state = AppState()
 
-asset_select = widgets.SelectMultiple(options=list(ASSET_TICKERS.keys()), value=tuple(DEFAULT_ASSETS), rows=8, layout=widgets.Layout(width="300px"))
+available_list = widgets.Select(options=list(ASSET_TICKERS.keys()), rows=8, layout=widgets.Layout(width="200px"))
+selected_list = widgets.Select(options=[], rows=8, layout=widgets.Layout(width="200px"))
+field_select = widgets.Dropdown(options=list(FIELD_OPTIONS.keys()), value="PX_LAST", description="Field:", layout=widgets.Layout(width="200px"))
+add_btn = widgets.Button(description="Add >>", button_style="info", layout=widgets.Layout(width="80px"))
+remove_btn = widgets.Button(description="<< Remove", button_style="warning", layout=widgets.Layout(width="80px"))
 start_date = widgets.DatePicker(value=(datetime.now() - timedelta(days=365*5)).date())
 end_date = widgets.DatePicker(value=datetime.now().date())
 load_btn = widgets.Button(description="Load Data", button_style="primary")
@@ -241,27 +295,50 @@ cohort_output = widgets.Output()
 num_pcs = widgets.IntSlider(value=1, min=1, max=5, description="PCs:")
 run_pca_btn = widgets.Button(description="Run PCA", button_style="primary")
 pca_output = widgets.Output()
-
 results_output = widgets.Output()
+
+pair_asset1 = widgets.Dropdown(options=[], description="Asset 1:", layout=widgets.Layout(width="200px"))
+pair_asset2 = widgets.Dropdown(options=[], description="Asset 2:", layout=widgets.Layout(width="200px"))
+pair_btn = widgets.Button(description="Analyze Pair", button_style="primary")
 chart_output = widgets.Output()
 
-pair_asset1 = widgets.Dropdown(options=list(ASSET_TICKERS.keys()), value="SPX Index", description="Asset 1:")
-pair_asset2 = widgets.Dropdown(options=list(ASSET_TICKERS.keys()), value="CDX HY", description="Asset 2:")
-pair_btn = widgets.Button(description="Show Relationship", button_style="info")
-pair_output = widgets.Output()
+def update_selected_display():
+    items = []
+    for asset in state.selected_assets:
+        field = state.field_map.get(asset, "PX_LAST")
+        items.append(f"{asset} [{field}]")
+    selected_list.options = items
+
+def on_add(b):
+    asset = available_list.value
+    if asset and asset not in state.selected_assets:
+        state.selected_assets.append(asset)
+        state.field_map[asset] = field_select.value
+        update_selected_display()
+
+def on_remove(b):
+    if selected_list.value:
+        asset = selected_list.value.split(" [")[0]
+        if asset in state.selected_assets:
+            state.selected_assets.remove(asset)
+            if asset in state.field_map:
+                del state.field_map[asset]
+            update_selected_display()
 
 def on_load(b):
     with data_output:
         clear_output(wait=True)
-        assets = list(asset_select.value)
-        if len(assets) < 3:
-            print("Select at least 3 assets")
+        if len(state.selected_assets) < 3:
+            print("Add at least 3 assets")
             return
-        state.raw_data = load_data_bql(assets, start_date.value.strftime("%Y-%m-%d"), end_date.value.strftime("%Y-%m-%d"))
+        state.raw_data = load_data_bql(state.selected_assets, state.field_map, start_date.value.strftime("%Y-%m-%d"), end_date.value.strftime("%Y-%m-%d"))
         state.returns = state.raw_data.pct_change().dropna()
-        print(f"Loaded {len(state.returns)} days for {len(assets)} assets")
-        pair_asset1.options = assets
-        pair_asset2.options = assets
+        print(f"Loaded {len(state.returns)} days for {len(state.selected_assets)} assets")
+        pair_asset1.options = state.selected_assets
+        pair_asset2.options = state.selected_assets
+        if len(state.selected_assets) >= 2:
+            pair_asset1.value = state.selected_assets[0]
+            pair_asset2.value = state.selected_assets[1]
 
 def on_run_tests(b):
     with tests_output:
@@ -304,33 +381,82 @@ def on_run_pca(b):
         opps = get_rv_opportunities(ranking)
         for trade, d in opps.items():
             display(HTML(f"<b>{trade}:</b> Short {d['Short']} ({d['Short Z']:+.2f}) / Long {d['Long']} ({d['Long Z']:+.2f}) | Spread: {d['Spread']:.2f}"))
-    with chart_output:
-        clear_output(wait=True)
-        fig = create_zscore_timeseries(z.iloc[-252:], list(z.columns))
-        display(fig)
 
 def on_pair(b):
-    with pair_output:
+    with chart_output:
         clear_output(wait=True)
-        if state.pca_results is None:
+        if state.pca_results is None or state.raw_data is None:
             print("Run PCA first")
             return
-        z = state.pca_results["z_scores"]
         a1, a2 = pair_asset1.value, pair_asset2.value
-        scatter = create_pair_scatter(z, a1, a2)
-        spread = create_spread_timeseries(z, a1, a2)
-        display(widgets.VBox([scatter, spread]))
+        if not a1 or not a2:
+            print("Select both assets")
+            return
+        z = state.pca_results["z_scores"]
+        kr_fig, beta, r2 = create_kernel_regression_chart(state.raw_data, a1, a2)
+        stats_html = HTML(f"<div style='background:#f8f9fa;padding:10px;border-radius:5px;margin:10px 0;'><b>Regression Stats:</b> Beta = {beta:.4f} | R² = {r2:.4f}</div>")
+        zscore_scatter = create_zscore_scatter(z, a1, a2)
+        spread_chart = create_zscore_spread_chart(z, a1, a2)
+        display(widgets.HBox([kr_fig, zscore_scatter]))
+        display(stats_html)
+        display(spread_chart)
 
+add_btn.on_click(on_add)
+remove_btn.on_click(on_remove)
 load_btn.on_click(on_load)
 run_tests_btn.on_click(on_run_tests)
 suggest_btn.on_click(on_suggest)
 run_pca_btn.on_click(on_run_pca)
 pair_btn.on_click(on_pair)
 
-tab1 = widgets.VBox([widgets.HTML("<h3>Data</h3>"), asset_select, widgets.HBox([start_date, end_date]), load_btn, data_output])
-tab2 = widgets.VBox([widgets.HTML("<h3>Validation</h3>"), run_tests_btn, tests_output, widgets.HTML("<br>"), suggest_btn, cohort_output])
-tab3 = widgets.VBox([widgets.HTML("<h3>PCA</h3>"), num_pcs, run_pca_btn, pca_output, widgets.HTML("<h4>Rankings</h4>"), results_output])
-tab4 = widgets.VBox([widgets.HTML("<h3>Charts</h3>"), chart_output, widgets.HTML("<h4>Pair Analysis</h4>"), widgets.HBox([pair_asset1, pair_asset2, pair_btn]), pair_output])
+for asset in DEFAULT_ASSETS:
+    state.selected_assets.append(asset)
+    state.field_map[asset] = "PX_LAST"
+update_selected_display()
+
+data_controls = widgets.VBox([
+    widgets.HTML("<b>Available</b>"),
+    available_list,
+    widgets.HBox([widgets.Label("Field:"), field_select]),
+])
+selected_controls = widgets.VBox([
+    widgets.HTML("<b>Selected Cohort</b>"),
+    selected_list,
+])
+button_controls = widgets.VBox([add_btn, remove_btn], layout=widgets.Layout(justify_content="center", margin="40px 10px"))
+
+tab1 = widgets.VBox([
+    widgets.HTML("<h3>Data Selection</h3>"),
+    widgets.HBox([data_controls, button_controls, selected_controls]),
+    widgets.HTML("<br>"),
+    widgets.HBox([widgets.Label("Start:"), start_date, widgets.Label("End:"), end_date]),
+    load_btn,
+    data_output
+])
+
+tab2 = widgets.VBox([
+    widgets.HTML("<h3>Validation</h3>"),
+    run_tests_btn,
+    tests_output,
+    widgets.HTML("<br>"),
+    suggest_btn,
+    cohort_output
+])
+
+tab3 = widgets.VBox([
+    widgets.HTML("<h3>PCA Analysis</h3>"),
+    num_pcs,
+    run_pca_btn,
+    pca_output,
+    widgets.HTML("<h4>Rankings</h4>"),
+    results_output
+])
+
+tab4 = widgets.VBox([
+    widgets.HTML("<h3>Pair Analysis</h3>"),
+    widgets.HBox([pair_asset1, pair_asset2, pair_btn]),
+    chart_output
+])
 
 tabs = widgets.Tab(children=[tab1, tab2, tab3, tab4])
 tabs.set_title(0, "Data")
