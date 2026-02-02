@@ -2,9 +2,24 @@
 
 ## Project Overview
 
-**Project:** Credit-Equity Relative Value Trading Tool
-**Purpose:** Analyze relationships between CDX (credit default swap indices) and Equity Indices (SPX, etc.) for macro credit trading decisions
+**Project:** PCA Rich/Cheap Analysis for Credit-Equity Indices
+**Purpose:** Identify rich/cheap opportunities across credit and equity indices for mean-reversion trading
 **Target Platform:** Bloomberg BQNT (Bloomberg Quant environment)
+
+### Current Implementation
+- **PCARichnessAnalyzer class** in `pca_richness_analysis.py`
+- PCA extracts PC1 (risk-off factor, ~73% variance explained)
+- Z-scores normalized: positive = RICH, negative = CHEAP for all assets
+- Generates rankings and RV trade opportunities
+
+### Assets (8 total)
+**Credit:** CDX IG, CDX HY, ITRX MAIN, ITRX XOVER
+**Equity:** SPX Index, NDX Index, RTY Index, SX5E Index
+
+### Development Priorities
+1. Rolling window PCA (replace static PCA)
+2. Backtest framework (measure historical Sharpe)
+3. Alert system (|Z| > 2 triggers)
 
 ## User Context
 
@@ -25,23 +40,28 @@ When writing code or explanations:
 - **Data Access:** Bloomberg API via `bql` and `bqplot`
 - **No:** pip install, internet access, file system writes outside workspace
 
-## Core Analysis Focus Areas
+## Core Analysis Concepts
 
-### 1. Spread Beta
-- Relationship between credit spread changes and equity index moves
-- How much does CDX move for a 1% move in SPX?
+### 1. PCA (Principal Component Analysis)
+- Extracts common factors driving all assets together
+- PC1 = "risk-off factor" (~73% of variance)
+- Credit loads positive (spreads widen in risk-off)
+- Equity loads negative (prices fall in risk-off)
 
-### 2. Duration Neutrality
-- Adjusting for interest rate sensitivity
-- Isolating pure credit risk from rates risk
+### 2. Residuals & Z-Scores
+- Residual = how much asset deviated from PC1 expectation
+- Z-score = residual in standard deviation units
+- |Z| > 2 = statistically unusual (strong signal)
 
-### 3. Regression Residuals
-- What's the "fair value" of credit given equity levels?
-- Identify when credit is rich/cheap vs equity
+### 3. Normalized Z-Score Convention
+- **Positive = RICH** (asset expensive vs peers)
+- **Negative = CHEAP** (asset cheap vs peers)
+- Credit z-scores flipped so convention is consistent
 
-### 4. Volatility-Adjusted Signals
-- Normalize signals by recent volatility (e.g., z-scores)
-- Avoid false signals in high-vol environments
+### 4. Relative Value (RV) Trades
+- Long the cheapest, short the richest
+- Can be within asset class (credit vs credit) or cross-asset
+- Mean-reversion expectation: z-scores converge to zero
 
 ## Coding Standards
 
@@ -84,31 +104,43 @@ Every function should have:
 | CDX | Credit Default Swap Index (basket of corporate credit risk) |
 | CDX IG | Investment Grade CDX (higher quality companies) |
 | CDX HY | High Yield CDX (lower quality, higher spread) |
+| ITRX | iTraxx - European credit indices |
 | Spread | Credit spread in basis points (bps); 100 bps = 1% |
 | SPX | S&P 500 Index |
-| Beta | Sensitivity/relationship coefficient |
-| DV01 | Dollar value of 1 basis point move |
+| NDX | Nasdaq 100 Index |
+| RTY | Russell 2000 Index (small caps) |
+| SX5E | Euro Stoxx 50 Index |
+| PCA | Principal Component Analysis - extracts common factors |
+| PC1 | First principal component (explains most variance) |
+| Loading | How much an asset moves with a PC (like beta) |
+| Residual | Actual minus expected (deviation from PC1 relationship) |
+| Z-Score | Standard deviations from mean; ±2 = strong signal |
 | Rich/Cheap | Expensive/Inexpensive relative to model fair value |
+| RV Trade | Relative Value - long cheap, short rich |
 
-## File Organization (Planned)
+## File Organization
 
 ```
 trading-tools/
-├── CLAUDE.md           # This file - project context
-├── data_fetchers/      # Bloomberg data retrieval
-├── analytics/          # Core calculations (beta, regression, etc.)
-├── signals/            # Trading signal generation
-├── visualization/      # Charts and dashboards
-└── notebooks/          # BQNT analysis notebooks
+├── CLAUDE.md                    # Project context for AI assistance
+├── pca_richness_analysis.py     # Main analysis class
+├── examples.py                  # 6 example use cases
+├── PCA_Cohort_Candidates.xlsx   # Historical data (2016-2026)
+├── requirements.txt             # Python dependencies
+├── README.md                    # Project documentation
+├── CLAUDE_CODE_GUIDE.md         # Development transition guide
+└── READY_FOR_CLAUDE_CODE.md     # Project summary
 ```
 
 ## Typical Workflow
 
-1. **Fetch Data** - Pull CDX spreads and equity index levels from Bloomberg
-2. **Clean & Align** - Match timestamps, handle holidays, fill gaps
-3. **Calculate Metrics** - Beta, regression residuals, z-scores
-4. **Generate Signals** - Identify rich/cheap opportunities
-5. **Visualize** - Charts showing relationships and current positioning
+1. **Load Data** - Read prices/spreads from Excel (or Bloomberg API)
+2. **Calculate Returns** - Daily percentage changes for all assets
+3. **Run PCA** - Standardize returns, extract PC1, get loadings
+4. **Calculate Residuals** - Actual vs expected (based on PC1)
+5. **Generate Z-Scores** - Normalize residuals, flip credit signs
+6. **Rank Assets** - Sort by z-score (most negative = cheapest)
+7. **Identify RV Trades** - Pair richest with cheapest
 
 ## Workflow Instructions
 
