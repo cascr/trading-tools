@@ -54,6 +54,11 @@ class PCARichnessAnalyzer:
         
         # Calculate returns
         self.returns = self.df.pct_change().dropna()
+
+        # Clean data: replace infinity with NaN, then drop rows with NaN
+        # This handles division-by-zero cases (e.g., price went to/from 0)
+        self.returns = self.returns.replace([np.inf, -np.inf], np.nan).dropna()
+
         print(f"[OK] Loaded {len(self.returns)} days from {self.returns.index[0].date()} to {self.returns.index[-1].date()}")
         
     def run_pca(self):

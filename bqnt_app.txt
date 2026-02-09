@@ -5,9 +5,9 @@ from IPython.display import display, HTML, clear_output
 from datetime import datetime, timedelta
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-from sklearn.kernel_ridge import KernelRidge
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
+from scipy.optimize import minimize
 from scipy import stats
 from itertools import combinations
 import bqplot as bqp
@@ -32,30 +32,67 @@ ASSET_TICKERS = {
     "SX5E Index": "SX5E Index",
 }
 
-FIELD_OPTIONS = {
-    "PX_LAST": "Last Price",
-    "PY026": "Roll Adjusted Mid Price",
-}
-
 COLORS = {
     "rich": "#e63946",
     "cheap": "#2a9d8f",
-    "neutral": "#6c757d",
-    "primary": "#264653",
+    "neutral": "#666666",
+    "primary": "#1a1a2e",
     "secondary": "#a8dadc",
-    "background": "#f8f9fa",
-    "threshold": "#dee2e6"
+    "background": "#fafafa",
+    "ols": "#f97316",
+    "kernel": "#22d3ee",
+    "sigmoid": "#a78bfa",
 }
+
+# Credit index roll dates - UPDATE THIS LIST every March and September
+ROLL_DATES = {
+    "CDX IG": [
+        "2015-03-20", "2015-09-21", "2016-03-21", "2016-09-20", "2017-03-20", "2017-09-20",
+        "2018-03-20", "2018-09-20", "2019-03-20", "2019-09-20", "2020-03-20", "2020-09-21",
+        "2021-03-22", "2021-09-20", "2022-03-21", "2022-09-20", "2023-03-20", "2023-09-20",
+        "2024-03-20", "2024-09-20", "2025-03-20", "2025-09-22",
+    ],
+    "CDX HY": [
+        "2015-03-27", "2015-09-28", "2016-03-28", "2016-09-27", "2017-03-27", "2017-09-27",
+        "2018-03-27", "2018-09-27", "2019-03-27", "2019-09-27", "2020-03-27", "2020-09-28",
+        "2021-03-29", "2021-09-27", "2022-03-28", "2022-09-27", "2023-03-27", "2023-09-27",
+        "2024-03-27", "2024-09-27", "2025-03-27", "2025-09-29",
+    ],
+    "ITRX MAIN": [
+        "2015-03-20", "2015-09-21", "2016-03-21", "2016-09-20", "2017-03-20", "2017-09-20",
+        "2018-03-20", "2018-09-20", "2019-03-20", "2019-09-20", "2020-03-20", "2020-09-21",
+        "2021-03-22", "2021-09-20", "2022-03-21", "2022-09-20", "2023-03-20", "2023-09-20",
+        "2024-03-20", "2024-09-20", "2025-03-20", "2025-09-22",
+    ],
+    "ITRX XOVER": [
+        "2015-03-20", "2015-09-21", "2016-03-21", "2016-09-20", "2017-03-20", "2017-09-20",
+        "2018-03-20", "2018-09-20", "2019-03-20", "2019-09-20", "2020-03-20", "2020-09-21",
+        "2021-03-22", "2021-09-20", "2022-03-21", "2022-09-20", "2023-03-20", "2023-09-20",
+        "2024-03-20", "2024-09-20", "2025-03-20", "2025-09-22",
+    ],
+}
+
+def check_roll_date_reminder():
+    today = datetime.now()
+    if (today.month == 3 and 15 <= today.day <= 31) or (today.month == 9 and 15 <= today.day <= 30):
+        current_year = today.year
+        cdx_dates = ROLL_DATES["CDX IG"]
+        latest_year = int(cdx_dates[-1][:4]) if cdx_dates else 0
+        if current_year > latest_year or (current_year == latest_year and today.month == 9 and "09" not in cdx_dates[-1]):
+            return True
+    return False
+
+def get_all_roll_dates():
+    all_dates = set()
+    for dates in ROLL_DATES.values():
+        all_dates.update(pd.to_datetime(dates))
+    return all_dates
 
 def load_data_bql(assets, field_map, start_date, end_date):
     all_dfs = []
     for asset in assets:
         ticker = ASSET_TICKERS.get(asset, asset)
-        field = field_map.get(asset, "PX_LAST")
-        if field == "PX_LAST":
-            data_item = bq.data.px_last(dates=bq.func.range(start_date, end_date))
-        else:
-            data_item = bq.data.py026(dates=bq.func.range(start_date, end_date))
+        data_item = bq.data.px_last(dates=bq.func.range(start_date, end_date))
         request = bql.Request(ticker, {"VALUE": data_item})
         response = bq.execute(request)
         df = response.single().df()
@@ -122,7 +159,10 @@ def run_validation_tests(returns):
     avg_lag = np.mean(lag_corrs)
     results["LeadLag"] = {"value": avg_lag, "status": "PASS" if avg_lag < 0.1 else "WARN"}
     dist = 1 - corr.abs()
-    condensed = squareform(dist.values)
+    dist_values = dist.values
+    dist_values = (dist_values + dist_values.T) / 2
+    np.fill_diagonal(dist_values, 0)
+    condensed = squareform(dist_values)
     linkage_matrix = linkage(condensed, method="ward")
     labels = fcluster(linkage_matrix, t=linkage_matrix[:, 2].max() * 0.5, criterion="distance")
     n_clusters = len(set(labels))
@@ -132,6 +172,7 @@ def run_validation_tests(returns):
 def run_pca_analysis(returns, num_pcs=1):
     credit = [a for a in returns.columns if a in CREDIT_ASSETS]
     equity = [a for a in returns.columns if a in EQUITY_ASSETS]
+    returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
     scaler = StandardScaler()
     data_scaled = scaler.fit_transform(returns)
     pca = PCA()
@@ -177,93 +218,297 @@ def get_rv_opportunities(ranking):
             opps[f"{asset_type} RV"] = {"Short": rich["Asset"], "Short Z": rich["Z-Score"], "Long": cheap["Asset"], "Long Z": cheap["Z-Score"], "Spread": rich["Z-Score"] - cheap["Z-Score"]}
     return opps
 
-def get_changes(raw_data, asset):
-    if asset in CREDIT_ASSETS:
-        return raw_data[asset].diff().dropna()
-    else:
-        return raw_data[asset].pct_change().dropna() * 100
-
-def create_kernel_regression_chart(raw_data, asset1, asset2, lookback=756):
-    recent = raw_data.iloc[-lookback:]
-    x_changes = get_changes(recent, asset1).values
-    y_changes = get_changes(recent, asset2).values
-    min_len = min(len(x_changes), len(y_changes))
-    x_changes = x_changes[-min_len:]
-    y_changes = y_changes[-min_len:]
-    mask = ~(np.isnan(x_changes) | np.isnan(y_changes))
-    x_clean = x_changes[mask]
-    y_clean = y_changes[mask]
-    slope, intercept, r_value, p_value, std_err = stats.linregress(x_clean, y_clean)
-    beta = slope
-    r_squared = r_value ** 2
-    kr = KernelRidge(alpha=1.0, kernel='rbf', gamma=0.1)
-    X_fit = x_clean.reshape(-1, 1)
-    kr.fit(X_fit, y_clean)
-    x_sorted_idx = np.argsort(x_clean)
-    x_sorted = x_clean[x_sorted_idx]
-    y_kr = kr.predict(x_sorted.reshape(-1, 1))
-    x_scale = bqp.LinearScale()
-    y_scale = bqp.LinearScale()
-    colors = np.linspace(0.2, 1, len(x_clean))
-    color_scale = bqp.ColorScale(colors=["#a8dadc", "#264653"])
-    scatter = bqp.Scatter(x=x_clean, y=y_clean, scales={'x': x_scale, 'y': y_scale, 'color': color_scale}, color=colors, default_size=15, opacities=[0.6]*len(x_clean))
-    kr_line = bqp.Lines(x=x_sorted, y=y_kr, scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["rich"]], stroke_width=3)
-    lin_y = intercept + slope * x_sorted
-    lin_line = bqp.Lines(x=x_sorted, y=lin_y, scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["primary"]], stroke_width=2, line_style="dashed")
-    x_label = f"{asset1} {'Spread Chg (bps)' if asset1 in CREDIT_ASSETS else '% Chg'}"
-    y_label = f"{asset2} {'Spread Chg (bps)' if asset2 in CREDIT_ASSETS else '% Chg'}"
-    x_axis = bqp.Axis(scale=x_scale, label=x_label, grid_lines="none")
-    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label=y_label, grid_lines="none")
-    tooltip = bqp.Tooltip(fields=['x', 'y'], formats=['.2f', '.2f'])
-    scatter.tooltip = tooltip
-    fig = bqp.Figure(marks=[scatter, kr_line, lin_line], axes=[x_axis, y_axis], title=f"Kernel Regression: {asset1} vs {asset2}", fig_margin={"top": 50, "bottom": 60, "left": 70, "right": 20}, background_style={"fill": COLORS["background"]})
-    fig.layout.width = "500px"
-    fig.layout.height = "400px"
-    return fig, beta, r_squared
+# ============================================================================
+# BLOOMBERG-STYLE Z-SCORE CHARTS
+# ============================================================================
 
 def create_zscore_scatter(z_scores, asset1, asset2, lookback=756):
+    """Bloomberg-style Z-Score scatter chart with interactive tooltips"""
     recent = z_scores.iloc[-lookback:]
     x_data = recent[asset1].values
     y_data = recent[asset2].values
+    dates = recent.index
+
     x_scale = bqp.LinearScale(min=-4, max=4)
     y_scale = bqp.LinearScale(min=-4, max=4)
-    colors = np.linspace(0.2, 1, len(x_data))
-    color_scale = bqp.ColorScale(colors=["#a8dadc", "#264653"])
-    scatter = bqp.Scatter(x=x_data, y=y_data, scales={'x': x_scale, 'y': y_scale, 'color': color_scale}, color=colors, default_size=15, opacities=[0.6]*len(x_data))
-    current = bqp.Scatter(x=[x_data[-1]], y=[y_data[-1]], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["rich"]], default_size=80, marker="diamond")
-    h_line = bqp.Lines(x=[-4, 4], y=[0, 0], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted", opacities=[0.5])
-    v_line = bqp.Lines(x=[0, 0], y=[-4, 4], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted", opacities=[0.5])
-    h2_pos = bqp.Lines(x=[-4, 4], y=[2, 2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
-    h2_neg = bqp.Lines(x=[-4, 4], y=[-2, -2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
-    v2_pos = bqp.Lines(x=[2, 2], y=[-4, 4], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
-    v2_neg = bqp.Lines(x=[-2, -2], y=[-4, 4], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
-    x_axis = bqp.Axis(scale=x_scale, label=f"{asset1} Z-Score", grid_lines="none")
-    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label=f"{asset2} Z-Score", grid_lines="none")
-    tooltip = bqp.Tooltip(fields=['x', 'y'], formats=['.2f', '.2f'])
-    scatter.tooltip = tooltip
-    current.tooltip = bqp.Tooltip(fields=['x', 'y'], formats=['.2f', '.2f'], labels=['Current X', 'Current Y'])
-    fig = bqp.Figure(marks=[h2_pos, h2_neg, v2_pos, v2_neg, h_line, v_line, scatter, current], axes=[x_axis, y_axis], title=f"Z-Score: {asset1} vs {asset2}", fig_margin={"top": 50, "bottom": 60, "left": 70, "right": 20}, background_style={"fill": COLORS["background"]})
-    fig.layout.width = "450px"
-    fig.layout.height = "400px"
+
+    # Time gradient colors
+    n_pts = len(x_data)
+    colors = np.linspace(0.3, 1.0, n_pts)
+    color_scale = bqp.ColorScale(colors=["#c0c0c0", "#1a1a2e"])
+
+    # Build tooltip labels with dates
+    date_labels = [d.strftime('%d%b%y') for d in dates]
+
+    scatter = bqp.Scatter(x=x_data, y=y_data, scales={'x': x_scale, 'y': y_scale, 'color': color_scale},
+                          color=colors, default_size=8, opacities=[0.6]*n_pts,
+                          names=date_labels, display_names=True)
+    scatter.tooltip = bqp.Tooltip(fields=['names', 'x', 'y'], formats=['', '.2f', '.2f'],
+                                   labels=['Date', f'{asset1} Z', f'{asset2} Z'])
+
+    # Current point (diamond)
+    current = bqp.Scatter(x=[x_data[-1]], y=[y_data[-1]], scales={'x': x_scale, 'y': y_scale},
+                          colors=[COLORS["rich"]], default_size=80, marker="diamond")
+    current.tooltip = bqp.Tooltip(fields=['x', 'y'], formats=['.2f', '.2f'],
+                                   labels=[f'{asset1} Z', f'{asset2} Z'])
+
+    # Reference lines: ±1 and ±2 z-scores
+    ref_lines = []
+    for val in [1, -1]:
+        ref_lines.append(bqp.Lines(x=[-4, 4], y=[val, val], scales={'x': x_scale, 'y': y_scale},
+                                    colors=["#ddd"], stroke_width=0.8, line_style="dashed"))
+        ref_lines.append(bqp.Lines(x=[val, val], y=[-4, 4], scales={'x': x_scale, 'y': y_scale},
+                                    colors=["#ddd"], stroke_width=0.8, line_style="dashed"))
+    for val in [2, -2]:
+        ref_lines.append(bqp.Lines(x=[-4, 4], y=[val, val], scales={'x': x_scale, 'y': y_scale},
+                                    colors=["#bbb"], stroke_width=1, line_style="dashed"))
+        ref_lines.append(bqp.Lines(x=[val, val], y=[-4, 4], scales={'x': x_scale, 'y': y_scale},
+                                    colors=["#bbb"], stroke_width=1, line_style="dashed"))
+    # Zero lines
+    h_zero = bqp.Lines(x=[-4, 4], y=[0, 0], scales={'x': x_scale, 'y': y_scale},
+                       colors=["#888"], stroke_width=1, line_style="dotted")
+    v_zero = bqp.Lines(x=[0, 0], y=[-4, 4], scales={'x': x_scale, 'y': y_scale},
+                       colors=["#888"], stroke_width=1, line_style="dotted")
+
+    x_axis = bqp.Axis(scale=x_scale, label=f"{asset1} Z", grid_lines="none", tick_format=".0f")
+    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label=f"{asset2} Z", grid_lines="none", tick_format=".0f")
+
+    fig = bqp.Figure(marks=ref_lines + [h_zero, v_zero, scatter, current],
+                     axes=[x_axis, y_axis],
+                     fig_margin={"top": 20, "bottom": 40, "left": 45, "right": 15},
+                     background_style={"fill": "#fafafa"})
+    fig.layout.width = "100%"
+    fig.layout.height = "340px"
+
     return fig
 
 def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756):
+    """Bloomberg-style Z-Score spread time series with interactive tooltips"""
     recent = z_scores.iloc[-lookback:]
     spread = recent[asset1] - recent[asset2]
     dates = recent.index.tolist()
+    y_data = spread.values
+    date_labels = [d.strftime('%d%b%y') for d in dates]
+
     x_scale = bqp.DateScale()
-    y_scale = bqp.LinearScale()
-    line = bqp.Lines(x=dates, y=spread.values, scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["primary"]], stroke_width=1.5)
-    zero_line = bqp.Lines(x=[dates[0], dates[-1]], y=[0, 0], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["neutral"]], line_style="dotted", opacities=[0.5])
-    pos2_line = bqp.Lines(x=[dates[0], dates[-1]], y=[2, 2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
-    neg2_line = bqp.Lines(x=[dates[0], dates[-1]], y=[-2, -2], scales={'x': x_scale, 'y': y_scale}, colors=[COLORS["threshold"]], line_style="dashed", opacities=[0.4])
+    y_min = max(-4, np.floor(y_data.min()) - 0.5)
+    y_max = min(4, np.ceil(y_data.max()) + 0.5)
+    y_scale = bqp.LinearScale(min=y_min, max=y_max)
+
+    # Line with scatter overlay for hover
+    line = bqp.Lines(x=dates, y=y_data, scales={'x': x_scale, 'y': y_scale},
+                     colors=[COLORS["primary"]], stroke_width=1.5)
+
+    # Invisible scatter for tooltips
+    scatter_hover = bqp.Scatter(x=dates, y=y_data, scales={'x': x_scale, 'y': y_scale},
+                                 colors=["transparent"], default_size=30, names=date_labels)
+    scatter_hover.tooltip = bqp.Tooltip(fields=['names', 'y'], formats=['', '.2f'],
+                                         labels=['Date', 'Z Spread'])
+
+    # Reference lines: ±1 and ±2
+    ref_lines = []
+    for val, col in [(1, "#ddd"), (-1, "#ddd"), (2, "#bbb"), (-2, "#bbb")]:
+        ref_lines.append(bqp.Lines(x=[dates[0], dates[-1]], y=[val, val], scales={'x': x_scale, 'y': y_scale},
+                                    colors=[col], stroke_width=0.8 if abs(val)==1 else 1, line_style="dashed"))
+    # Zero line
+    zero = bqp.Lines(x=[dates[0], dates[-1]], y=[0, 0], scales={'x': x_scale, 'y': y_scale},
+                     colors=["#888"], stroke_width=1, line_style="dotted")
+
     x_axis = bqp.Axis(scale=x_scale, grid_lines="none")
-    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label="Z-Score Spread", grid_lines="solid", grid_color="#e0e0e0")
-    index_sel = bqp.interacts.IndexSelector(scale=x_scale, marks=[line])
-    fig = bqp.Figure(marks=[pos2_line, neg2_line, zero_line, line], axes=[x_axis, y_axis], title=f"Z-Score Spread: {asset1} minus {asset2}", fig_margin={"top": 50, "bottom": 40, "left": 70, "right": 20}, background_style={"fill": COLORS["background"]}, interaction=index_sel)
+    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label="Z Spread", grid_lines="solid", grid_color="#eee", tick_format=".1f")
+
+    fig = bqp.Figure(marks=ref_lines + [zero, line, scatter_hover], axes=[x_axis, y_axis],
+                     fig_margin={"top": 15, "bottom": 35, "left": 45, "right": 15},
+                     background_style={"fill": "#fafafa"})
     fig.layout.width = "100%"
     fig.layout.height = "280px"
+
     return fig
+
+def create_zscore_stats_html(z_scores, asset1, asset2, lookback=756):
+    """Compact Bloomberg-style stats box for Z-Score spread"""
+    recent = z_scores.iloc[-lookback:]
+    spread = (recent[asset1] - recent[asset2]).values
+    dates = recent.index
+    hi, lo = np.argmax(spread), np.argmin(spread)
+
+    return f"""<div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:3px;padding:6px 10px;font-family:monospace;font-size:9px;display:inline-block;">
+    <table style="border-collapse:collapse;line-height:1.4;">
+    <tr><td style="padding-right:8px;"><b>First</b> {dates[0].strftime('%d%b%y')}</td><td style="text-align:right;padding-right:12px;">{spread[0]:.2f}</td>
+        <td style="padding-right:8px;"><b>Last</b> {dates[-1].strftime('%d%b%y')}</td><td style="text-align:right;">{spread[-1]:.2f}</td></tr>
+    <tr><td style="padding-right:8px;"><b>High</b> {dates[hi].strftime('%d%b%y')}</td><td style="text-align:right;padding-right:12px;">{spread[hi]:.2f}</td>
+        <td style="padding-right:8px;"><b>Low</b> {dates[lo].strftime('%d%b%y')}</td><td style="text-align:right;">{spread[lo]:.2f}</td></tr>
+    <tr><td style="padding-right:8px;"><b>Mean</b></td><td style="text-align:right;padding-right:12px;">{np.mean(spread):.2f}</td>
+        <td style="padding-right:8px;"><b>Std</b></td><td style="text-align:right;">{np.std(spread):.2f}</td></tr>
+    </table></div>"""
+
+# ============================================================================
+# REGIME MAP FUNCTIONS
+# ============================================================================
+
+def load_regime_data(start_date, end_date):
+    spx_request = bql.Request("SPX Index", {"PX": bq.data.px_last(dates=bq.func.range(start_date, end_date))})
+    spx_response = bq.execute(spx_request)
+    spx_df = spx_response.single().df().reset_index()
+    spx_df = spx_df[["DATE", "PX"]].rename(columns={"PX": "SPX"}).set_index("DATE")
+
+    cdx_request = bql.Request("CDX IG CDSI GEN 5Y Corp", {"PX": bq.data.px_last(dates=bq.func.range(start_date, end_date))})
+    cdx_response = bq.execute(cdx_request)
+    cdx_df = cdx_response.single().df().reset_index()
+    cdx_df = cdx_df[["DATE", "PX"]].rename(columns={"PX": "CDX"}).set_index("DATE")
+
+    df = pd.concat([spx_df, cdx_df], axis=1).dropna()
+    df["SPX_MA200"] = df["SPX"].rolling(window=200).mean()
+    df["SPX_DEV"] = ((df["SPX"] / df["SPX_MA200"]) - 1) * 100
+    df = df.dropna()
+    return df
+
+def regime_ols(x, y):
+    n = len(x)
+    sx, sy, sxy, sxx = np.sum(x), np.sum(y), np.sum(x * y), np.sum(x * x)
+    b = (n * sxy - sx * sy) / (n * sxx - sx * sx)
+    a = (sy - b * sx) / n
+    return {"intercept": a, "slope": b}
+
+def regime_kernel(x_data, y_data, x_grid, bandwidth=4):
+    y_pred = []
+    for xg in x_grid:
+        u = (x_data - xg) / bandwidth
+        w = np.exp(-0.5 * u * u)
+        w_sum = np.sum(w)
+        y_pred.append(np.sum(w * y_data) / w_sum if w_sum > 0 else 0)
+    return np.array(y_pred)
+
+def sigmoid_val(x, params):
+    floor, ceiling, k, midpoint = params
+    arg = np.clip(k * (x - midpoint), -500, 500)
+    return floor + (ceiling - floor) / (1 + np.exp(arg))
+
+def sigmoid_deriv(x, params):
+    floor, ceiling, k, midpoint = params
+    arg = np.clip(k * (x - midpoint), -500, 500)
+    exp_term = np.exp(arg)
+    return -(ceiling - floor) * k * exp_term / (1 + exp_term) ** 2
+
+def fit_sigmoid(x_data, y_data):
+    def cost(params):
+        floor, ceiling, k, midpoint = params
+        if floor < 38 or floor > 60 or ceiling < 100 or ceiling > 300:
+            return 1e15
+        if k < 0.05 or k > 2.0 or midpoint < -25 or midpoint > 0:
+            return 1e15
+        if ceiling - floor < 60:
+            return 1e15
+        return np.sum((sigmoid_val(x_data, params) - y_data) ** 2)
+
+    starts = [
+        [48, 170, 0.15, -12], [47, 160, 0.20, -10], [50, 180, 0.25, -15],
+        [46, 200, 0.10, -8], [48, 150, 0.30, -18], [45, 190, 0.12, -14],
+    ]
+    best_result, best_cost = None, 1e15
+    for start in starts:
+        result = minimize(cost, start, method='Nelder-Mead', options={'maxiter': 10000})
+        if result.fun < best_cost:
+            best_cost, best_result = result.fun, result.x
+    return {"floor": best_result[0], "ceiling": best_result[1], "steepness": best_result[2], "midpoint": best_result[3]}
+
+def kernel_deriv(x_data, y_data, x_point, bandwidth=4, delta=0.01):
+    y_minus = regime_kernel(x_data, y_data, [x_point - delta], bandwidth)[0]
+    y_plus = regime_kernel(x_data, y_data, [x_point + delta], bandwidth)[0]
+    return (y_plus - y_minus) / (2 * delta)
+
+def calc_beta_table(x_data, y_data, ols_result, sig_params, bandwidth=4):
+    x_mean, x_std = np.mean(x_data), np.std(x_data)
+    points = [
+        ("-3σ", x_mean - 3*x_std), ("-2σ", x_mean - 2*x_std), ("-1σ", x_mean - x_std),
+        ("Mean", x_mean),
+        ("+1σ", x_mean + x_std), ("+2σ", x_mean + 2*x_std), ("+3σ", x_mean + 3*x_std),
+    ]
+    rows = []
+    for label, xp in points:
+        sig_p = [sig_params["floor"], sig_params["ceiling"], sig_params["steepness"], sig_params["midpoint"]]
+        rows.append({
+            "Pt": label, "SPX%": f"{xp:.1f}",
+            "OLS": f"{ols_result['slope']:.2f}",
+            "Kern": f"{kernel_deriv(x_data, y_data, xp, bandwidth):.2f}",
+            "Sig": f"{sigmoid_deriv(xp, sig_p):.2f}",
+        })
+    return pd.DataFrame(rows)
+
+def create_regime_chart(df, ols_result, kernel_y, sigmoid_y, x_grid, show_ols, show_kernel, show_sigmoid):
+    x_data, y_data = df["SPX_DEV"].values, df["CDX"].values
+    dates = df.index
+    x_min, x_max = x_grid.min(), x_grid.max()
+    y_min = max(35, np.floor(y_data.min() / 5) * 5 - 5)
+    y_max = min(250, np.ceil(y_data.max() / 10) * 10 + 10)
+    x_scale, y_scale = bqp.LinearScale(min=x_min, max=x_max), bqp.LinearScale(min=y_min, max=y_max)
+
+    n_pts = len(x_data)
+    colors = np.linspace(0.3, 1.0, n_pts)
+    color_scale = bqp.ColorScale(colors=["#c0c0c0", "#1a1a2e"])
+    date_labels = [d.strftime('%d%b%y') for d in dates]
+
+    scatter = bqp.Scatter(x=x_data, y=y_data, scales={'x': x_scale, 'y': y_scale, 'color': color_scale},
+                          color=colors, default_size=8, opacities=[0.6]*n_pts, names=date_labels)
+    scatter.tooltip = bqp.Tooltip(fields=['names', 'x', 'y'], formats=['', '.1f', '.1f'],
+                                   labels=['Date', 'SPX Dev%', 'CDX bps'])
+
+    marks = [scatter]
+    if show_ols:
+        ols_y = ols_result["intercept"] + ols_result["slope"] * x_grid
+        marks.append(bqp.Lines(x=x_grid, y=ols_y, scales={'x': x_scale, 'y': y_scale},
+                               colors=[COLORS["ols"]], stroke_width=1.5, line_style="dashed"))
+    if show_kernel:
+        marks.append(bqp.Lines(x=x_grid, y=kernel_y, scales={'x': x_scale, 'y': y_scale},
+                               colors=[COLORS["kernel"]], stroke_width=2))
+    if show_sigmoid:
+        marks.append(bqp.Lines(x=x_grid, y=sigmoid_y, scales={'x': x_scale, 'y': y_scale},
+                               colors=[COLORS["sigmoid"]], stroke_width=2))
+    # Zero line
+    marks.append(bqp.Lines(x=[0, 0], y=[y_min, y_max], scales={'x': x_scale, 'y': y_scale},
+                           colors=["#888"], stroke_width=1, line_style="dotted"))
+
+    x_axis = bqp.Axis(scale=x_scale, label="SPX % Dev from 200d MA", grid_lines="none", tick_format=".0f")
+    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label="CDX IG (bps)", grid_lines="solid", grid_color="#eee", tick_format=".0f")
+
+    fig = bqp.Figure(marks=marks, axes=[x_axis, y_axis],
+                     fig_margin={"top": 20, "bottom": 45, "left": 50, "right": 15},
+                     background_style={"fill": "#fafafa"})
+    fig.layout.width = "100%"
+    fig.layout.height = "420px"
+    return fig
+
+def create_regime_stats_html(df):
+    """Compact stats box for regime map"""
+    y = df["CDX"].values
+    dates = df.index
+    hi, lo = np.argmax(y), np.argmin(y)
+    return f"""<div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:3px;padding:6px 10px;font-family:monospace;font-size:9px;display:inline-block;">
+    <table style="border-collapse:collapse;line-height:1.4;">
+    <tr><td style="padding-right:8px;"><b>First</b> {dates[0].strftime('%d%b%y')}</td><td style="text-align:right;padding-right:12px;">{y[0]:.0f}</td>
+        <td style="padding-right:8px;"><b>Last</b> {dates[-1].strftime('%d%b%y')}</td><td style="text-align:right;">{y[-1]:.0f}</td></tr>
+    <tr><td style="padding-right:8px;"><b>High</b> {dates[hi].strftime('%d%b%y')}</td><td style="text-align:right;padding-right:12px;">{y[hi]:.0f}</td>
+        <td style="padding-right:8px;"><b>Low</b> {dates[lo].strftime('%d%b%y')}</td><td style="text-align:right;">{y[lo]:.0f}</td></tr>
+    <tr><td style="padding-right:8px;"><b>Mean</b></td><td style="text-align:right;padding-right:12px;">{np.mean(y):.0f}</td>
+        <td style="padding-right:8px;"><b>Std</b></td><td style="text-align:right;">{np.std(y):.0f}</td></tr>
+    </table></div>"""
+
+def create_beta_table_html(beta_df):
+    """Compact beta table HTML"""
+    html = '<div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:3px;padding:6px 10px;font-family:monospace;font-size:9px;display:inline-block;margin-left:10px;">'
+    html += '<table style="border-collapse:collapse;line-height:1.4;"><tr style="border-bottom:1px solid #ccc;">'
+    html += '<th style="padding-right:8px;text-align:left;">Pt</th><th style="padding-right:8px;">SPX%</th>'
+    html += '<th style="padding-right:8px;color:#f97316;">OLS</th><th style="padding-right:8px;color:#22d3ee;">Kern</th><th style="color:#a78bfa;">Sig</th></tr>'
+    for _, row in beta_df.iterrows():
+        html += f'<tr><td style="padding-right:8px;"><b>{row["Pt"]}</b></td><td style="padding-right:8px;text-align:right;">{row["SPX%"]}</td>'
+        html += f'<td style="padding-right:8px;text-align:right;">{row["OLS"]}</td><td style="padding-right:8px;text-align:right;">{row["Kern"]}</td>'
+        html += f'<td style="text-align:right;">{row["Sig"]}</td></tr>'
+    html += '</table></div>'
+    return html
+
+# ============================================================================
+# APP STATE
+# ============================================================================
 
 class AppState:
     def __init__(self):
@@ -274,12 +519,22 @@ class AppState:
         self.suggested_cohorts = None
         self.selected_assets = []
         self.field_map = {}
+        # Regime map state
+        self.regime_df = None
+        self.regime_ols = None
+        self.regime_sigmoid = None
+        self.regime_x_grid = None
+        self.regime_kernel_y = None
+        self.regime_sigmoid_y = None
 
 state = AppState()
 
+# ============================================================================
+# TAB 1: DATA WIDGETS
+# ============================================================================
+
 available_list = widgets.Select(options=list(ASSET_TICKERS.keys()), rows=8, layout=widgets.Layout(width="200px"))
 selected_list = widgets.Select(options=[], rows=8, layout=widgets.Layout(width="200px"))
-field_select = widgets.Dropdown(options=list(FIELD_OPTIONS.keys()), value="PX_LAST", description="Field:", layout=widgets.Layout(width="200px"))
 add_btn = widgets.Button(description="Add >>", button_style="info", layout=widgets.Layout(width="80px"))
 remove_btn = widgets.Button(description="<< Remove", button_style="warning", layout=widgets.Layout(width="80px"))
 start_date = widgets.DatePicker(value=(datetime.now() - timedelta(days=365*5)).date())
@@ -287,38 +542,79 @@ end_date = widgets.DatePicker(value=datetime.now().date())
 load_btn = widgets.Button(description="Load Data", button_style="primary")
 data_output = widgets.Output()
 
+# ============================================================================
+# TAB 2: VALIDATION WIDGETS
+# ============================================================================
+
 run_tests_btn = widgets.Button(description="Run Validation", button_style="primary")
 suggest_btn = widgets.Button(description="Suggest Cohorts", button_style="info")
 tests_output = widgets.Output()
 cohort_output = widgets.Output()
+
+# ============================================================================
+# TAB 3: PCA WIDGETS
+# ============================================================================
 
 num_pcs = widgets.IntSlider(value=1, min=1, max=5, description="PCs:")
 run_pca_btn = widgets.Button(description="Run PCA", button_style="primary")
 pca_output = widgets.Output()
 results_output = widgets.Output()
 
-pair_asset1 = widgets.Dropdown(options=[], description="Asset 1:", layout=widgets.Layout(width="200px"))
-pair_asset2 = widgets.Dropdown(options=[], description="Asset 2:", layout=widgets.Layout(width="200px"))
-pair_btn = widgets.Button(description="Analyze Pair", button_style="primary")
-chart_output = widgets.Output()
+# ============================================================================
+# TAB 4: CHARTS (COMBINED) WIDGETS
+# ============================================================================
+
+# Pair selection for Z-Score charts
+pair_asset1 = widgets.Dropdown(options=[], description="Asset 1:", layout=widgets.Layout(width="160px"),
+                                style={'description_width': '55px'})
+pair_asset2 = widgets.Dropdown(options=[], description="Asset 2:", layout=widgets.Layout(width="160px"),
+                                style={'description_width': '55px'})
+zscore_btn = widgets.Button(description="Update", button_style="info", layout=widgets.Layout(width="70px"))
+zscore_output = widgets.Output()
+
+# Regime Map controls
+regime_start = widgets.DatePicker(value=(datetime.now() - timedelta(days=365*10)).date(),
+                                   layout=widgets.Layout(width="130px"))
+regime_end = widgets.DatePicker(value=datetime.now().date(), layout=widgets.Layout(width="130px"))
+regime_load_btn = widgets.Button(description="Load", button_style="primary", layout=widgets.Layout(width="60px"))
+regime_load_output = widgets.Output()
+
+regime_show_ols = widgets.Checkbox(value=True, description="OLS", indent=False, layout=widgets.Layout(width="60px"))
+regime_show_kernel = widgets.Checkbox(value=True, description="Kernel", indent=False, layout=widgets.Layout(width="70px"))
+regime_show_sigmoid = widgets.Checkbox(value=True, description="Sigmoid", indent=False, layout=widgets.Layout(width="80px"))
+regime_bandwidth = widgets.FloatSlider(value=4, min=1, max=10, step=0.5, description="BW:",
+                                        style={'description_width': '25px'}, layout=widgets.Layout(width="140px"))
+regime_update_btn = widgets.Button(description="Update", button_style="info", layout=widgets.Layout(width="60px"))
+
+regime_floor = widgets.FloatSlider(value=48, min=38, max=60, step=0.5, description="Floor:",
+                                    style={'description_width': '40px'}, layout=widgets.Layout(width="140px"))
+regime_ceiling = widgets.FloatSlider(value=170, min=100, max=300, step=5, description="Ceil:",
+                                      style={'description_width': '40px'}, layout=widgets.Layout(width="140px"))
+regime_steep = widgets.FloatSlider(value=0.15, min=0.05, max=0.5, step=0.01, description="K:",
+                                    style={'description_width': '20px'}, layout=widgets.Layout(width="130px"))
+regime_mid = widgets.FloatSlider(value=-12, min=-25, max=0, step=0.5, description="Mid:",
+                                  style={'description_width': '30px'}, layout=widgets.Layout(width="130px"))
+
+regime_chart_output = widgets.Output()
+regime_tables_output = widgets.Output()
+
+# ============================================================================
+# CALLBACKS
+# ============================================================================
 
 def update_selected_display():
-    items = []
-    for asset in state.selected_assets:
-        field = state.field_map.get(asset, "PX_LAST")
-        items.append(f"{asset} [{field}]")
-    selected_list.options = items
+    selected_list.options = state.selected_assets
 
 def on_add(b):
     asset = available_list.value
     if asset and asset not in state.selected_assets:
         state.selected_assets.append(asset)
-        state.field_map[asset] = field_select.value
+        state.field_map[asset] = "PX_LAST"
         update_selected_display()
 
 def on_remove(b):
     if selected_list.value:
-        asset = selected_list.value.split(" [")[0]
+        asset = selected_list.value
         if asset in state.selected_assets:
             state.selected_assets.remove(asset)
             if asset in state.field_map:
@@ -331,8 +627,16 @@ def on_load(b):
         if len(state.selected_assets) < 3:
             print("Add at least 3 assets")
             return
+        if check_roll_date_reminder():
+            display(HTML("<div style='background:#fff3cd;padding:10px;border-radius:5px;margin-bottom:10px;'><b>⚠️ REMINDER:</b> Update ROLL_DATES list!</div>"))
         state.raw_data = load_data_bql(state.selected_assets, state.field_map, start_date.value.strftime("%Y-%m-%d"), end_date.value.strftime("%Y-%m-%d"))
+        roll_dates = get_all_roll_dates()
+        dates_to_remove = state.raw_data.index.intersection(roll_dates)
+        if len(dates_to_remove) > 0:
+            state.raw_data = state.raw_data.drop(dates_to_remove)
+            print(f"Removed {len(dates_to_remove)} roll dates")
         state.returns = state.raw_data.pct_change().dropna()
+        state.returns = state.returns.replace([np.inf, -np.inf], np.nan).dropna()
         print(f"Loaded {len(state.returns)} days for {len(state.selected_assets)} assets")
         pair_asset1.options = state.selected_assets
         pair_asset2.options = state.selected_assets
@@ -382,10 +686,10 @@ def on_run_pca(b):
         for trade, d in opps.items():
             display(HTML(f"<b>{trade}:</b> Short {d['Short']} ({d['Short Z']:+.2f}) / Long {d['Long']} ({d['Long Z']:+.2f}) | Spread: {d['Spread']:.2f}"))
 
-def on_pair(b):
-    with chart_output:
+def on_zscore_update(b):
+    with zscore_output:
         clear_output(wait=True)
-        if state.pca_results is None or state.raw_data is None:
+        if state.pca_results is None:
             print("Run PCA first")
             return
         a1, a2 = pair_asset1.value, pair_asset2.value
@@ -393,13 +697,68 @@ def on_pair(b):
             print("Select both assets")
             return
         z = state.pca_results["z_scores"]
-        kr_fig, beta, r2 = create_kernel_regression_chart(state.raw_data, a1, a2)
-        stats_html = HTML(f"<div style='background:#f8f9fa;padding:10px;border-radius:5px;margin:10px 0;'><b>Regression Stats:</b> Beta = {beta:.4f} | R² = {r2:.4f}</div>")
-        zscore_scatter = create_zscore_scatter(z, a1, a2)
-        spread_chart = create_zscore_spread_chart(z, a1, a2)
-        display(widgets.HBox([kr_fig, zscore_scatter]))
-        display(stats_html)
-        display(spread_chart)
+        display(HTML(f"<b style='font-size:11px;'>{a1} vs {a2}</b>"))
+        # Stacked charts
+        scatter_fig = create_zscore_scatter(z, a1, a2)
+        spread_fig = create_zscore_spread_chart(z, a1, a2)
+        display(scatter_fig)
+        display(spread_fig)
+        # Stats below
+        display(HTML(create_zscore_stats_html(z, a1, a2)))
+
+def on_regime_load(b):
+    with regime_load_output:
+        clear_output(wait=True)
+        print("Loading...")
+    try:
+        state.regime_df = load_regime_data(regime_start.value.strftime("%Y-%m-%d"), regime_end.value.strftime("%Y-%m-%d"))
+        x_data, y_data = state.regime_df["SPX_DEV"].values, state.regime_df["CDX"].values
+        state.regime_ols = regime_ols(x_data, y_data)
+        state.regime_sigmoid = fit_sigmoid(x_data, y_data)
+        regime_floor.value = state.regime_sigmoid["floor"]
+        regime_ceiling.value = state.regime_sigmoid["ceiling"]
+        regime_steep.value = state.regime_sigmoid["steepness"]
+        regime_mid.value = state.regime_sigmoid["midpoint"]
+        state.regime_x_grid = np.linspace(x_data.min() - 5, x_data.max() + 5, 300)
+        state.regime_kernel_y = regime_kernel(x_data, y_data, state.regime_x_grid, regime_bandwidth.value)
+        sig_p = [state.regime_sigmoid["floor"], state.regime_sigmoid["ceiling"], state.regime_sigmoid["steepness"], state.regime_sigmoid["midpoint"]]
+        state.regime_sigmoid_y = sigmoid_val(state.regime_x_grid, sig_p)
+        with regime_load_output:
+            clear_output(wait=True)
+            print(f"{len(state.regime_df)} days | floor={state.regime_sigmoid['floor']:.1f} ceil={state.regime_sigmoid['ceiling']:.1f}")
+        update_regime_display()
+    except Exception as e:
+        with regime_load_output:
+            clear_output(wait=True)
+            print(f"Error: {e}")
+
+def update_regime_display():
+    if state.regime_df is None:
+        return
+    x_data, y_data = state.regime_df["SPX_DEV"].values, state.regime_df["CDX"].values
+    state.regime_kernel_y = regime_kernel(x_data, y_data, state.regime_x_grid, regime_bandwidth.value)
+    sig_p = [regime_floor.value, regime_ceiling.value, regime_steep.value, regime_mid.value]
+    state.regime_sigmoid_y = sigmoid_val(state.regime_x_grid, sig_p)
+
+    with regime_chart_output:
+        clear_output(wait=True)
+        fig = create_regime_chart(state.regime_df, state.regime_ols, state.regime_kernel_y, state.regime_sigmoid_y,
+                                   state.regime_x_grid, regime_show_ols.value, regime_show_kernel.value, regime_show_sigmoid.value)
+        display(fig)
+    with regime_tables_output:
+        clear_output(wait=True)
+        sig_params = {"floor": regime_floor.value, "ceiling": regime_ceiling.value, "steepness": regime_steep.value, "midpoint": regime_mid.value}
+        beta_df = calc_beta_table(x_data, y_data, state.regime_ols, sig_params, regime_bandwidth.value)
+        stats_html = create_regime_stats_html(state.regime_df)
+        beta_html = create_beta_table_html(beta_df)
+        display(HTML(f'<div style="display:flex;flex-wrap:wrap;align-items:flex-start;">{stats_html}{beta_html}</div>'))
+
+def on_regime_update(b):
+    update_regime_display()
+
+# ============================================================================
+# CONNECT CALLBACKS
+# ============================================================================
 
 add_btn.on_click(on_add)
 remove_btn.on_click(on_remove)
@@ -407,22 +766,21 @@ load_btn.on_click(on_load)
 run_tests_btn.on_click(on_run_tests)
 suggest_btn.on_click(on_suggest)
 run_pca_btn.on_click(on_run_pca)
-pair_btn.on_click(on_pair)
+zscore_btn.on_click(on_zscore_update)
+regime_load_btn.on_click(on_regime_load)
+regime_update_btn.on_click(on_regime_update)
+regime_show_ols.observe(lambda c: update_regime_display(), names='value')
+regime_show_kernel.observe(lambda c: update_regime_display(), names='value')
+regime_show_sigmoid.observe(lambda c: update_regime_display(), names='value')
 
-for asset in DEFAULT_ASSETS:
-    state.selected_assets.append(asset)
-    state.field_map[asset] = "PX_LAST"
 update_selected_display()
 
-data_controls = widgets.VBox([
-    widgets.HTML("<b>Available</b>"),
-    available_list,
-    widgets.HBox([widgets.Label("Field:"), field_select]),
-])
-selected_controls = widgets.VBox([
-    widgets.HTML("<b>Selected Cohort</b>"),
-    selected_list,
-])
+# ============================================================================
+# LAYOUT
+# ============================================================================
+
+data_controls = widgets.VBox([widgets.HTML("<b>Available</b>"), available_list])
+selected_controls = widgets.VBox([widgets.HTML("<b>Selected Cohort</b>"), selected_list])
 button_controls = widgets.VBox([add_btn, remove_btn], layout=widgets.Layout(justify_content="center", margin="40px 10px"))
 
 tab1 = widgets.VBox([
@@ -430,32 +788,41 @@ tab1 = widgets.VBox([
     widgets.HBox([data_controls, button_controls, selected_controls]),
     widgets.HTML("<br>"),
     widgets.HBox([widgets.Label("Start:"), start_date, widgets.Label("End:"), end_date]),
-    load_btn,
-    data_output
+    load_btn, data_output
 ])
 
 tab2 = widgets.VBox([
     widgets.HTML("<h3>Validation</h3>"),
-    run_tests_btn,
-    tests_output,
-    widgets.HTML("<br>"),
-    suggest_btn,
-    cohort_output
+    run_tests_btn, tests_output, widgets.HTML("<br>"),
+    suggest_btn, cohort_output
 ])
 
 tab3 = widgets.VBox([
     widgets.HTML("<h3>PCA Analysis</h3>"),
-    num_pcs,
-    run_pca_btn,
-    pca_output,
-    widgets.HTML("<h4>Rankings</h4>"),
-    results_output
+    num_pcs, run_pca_btn, pca_output,
+    widgets.HTML("<h4>Rankings</h4>"), results_output
 ])
 
+# Combined Charts Tab - Compact layout
 tab4 = widgets.VBox([
-    widgets.HTML("<h3>Pair Analysis</h3>"),
-    widgets.HBox([pair_asset1, pair_asset2, pair_btn]),
-    chart_output
+    widgets.HTML("<h3>Charts</h3>"),
+    # Z-Score Section
+    widgets.HTML("<b style='font-size:11px;'>Z-Score Analysis</b>"),
+    widgets.HBox([pair_asset1, pair_asset2, zscore_btn]),
+    zscore_output,
+    widgets.HTML("<hr style='margin:8px 0;border-color:#ddd;'>"),
+    # Regime Map Section - Controls bunched together
+    widgets.HTML("<b style='font-size:11px;'>Credit-Equity Regime Map (SPX vs CDX IG)</b>"),
+    widgets.HBox([widgets.HTML("<span style='font-size:10px;margin-right:5px;'>Date:</span>"),
+                  regime_start, regime_end, regime_load_btn, regime_load_output],
+                 layout=widgets.Layout(align_items="center")),
+    widgets.HBox([regime_show_ols, regime_show_kernel, regime_show_sigmoid, regime_bandwidth, regime_update_btn],
+                 layout=widgets.Layout(margin="2px 0")),
+    widgets.HBox([widgets.HTML("<span style='font-size:9px;color:#a78bfa;margin-right:5px;'>Sigmoid:</span>"),
+                  regime_floor, regime_ceiling, regime_steep, regime_mid],
+                 layout=widgets.Layout(margin="2px 0", align_items="center")),
+    regime_chart_output,
+    regime_tables_output,
 ])
 
 tabs = widgets.Tab(children=[tab1, tab2, tab3, tab4])
