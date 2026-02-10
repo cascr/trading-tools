@@ -23,7 +23,7 @@ DEFAULT_ASSETS = CREDIT_ASSETS + EQUITY_ASSETS
 
 ASSET_TICKERS = {
     "CDX IG": "CDX IG CDSI GEN 5Y Corp",
-    "CDX HY": "CDX HY CDSI GEN 5Y Corp",
+    "CDX HY": "IBOXHYSE CBBT Curncy",
     "ITRX MAIN": "ITRX EUR CDSI GEN 5Y Corp",
     "ITRX XOVER": "ITRX XOVER CDSI GEN 5Y Corp",
     "SPX Index": "SPX Index",
@@ -33,18 +33,42 @@ ASSET_TICKERS = {
 }
 
 COLORS = {
-    "rich": "#e63946",
-    "cheap": "#2a9d8f",
-    "neutral": "#666666",
-    "primary": "#1a1a2e",
-    "secondary": "#a8dadc",
-    "background": "#fafafa",
-    "ols": "#f97316",
-    "kernel": "#22d3ee",
-    "sigmoid": "#a78bfa",
+    # Background
+    "pageBg": "#0f0f1a",
+    "chartBg": "#12121f",
+    "panelBorder": "#1e1e3a",
+    "gridLines": "#1a1a30",
+    # Text
+    "textPrimary": "#f0f0f0",
+    "textSecondary": "#e0e0e0",
+    "textMuted": "#888",
+    "textDim": "#666",
+    # Data series
+    "cyan": "#22d3ee",
+    "purple": "#a78bfa",
+    "orange": "#f97316",
+    # Signals
+    "green": "#34d399",
+    "red": "#ef4444",
+    "gold": "#fbbf24",
+    # Scatter points
+    "scatterFill": "#6366f1",
+    "scatterStroke": "#818cf8",
+    # UI elements
+    "inputBg": "#1a1a2e",
+    "inputBorder": "#333",
 }
 
 # Credit index roll dates - UPDATE THIS LIST every March and September
+# Pre-defined stress periods for regime analysis
+STRESS_PERIODS = {
+    "2015 China Deval": ("2015-08-01", "2015-10-31"),
+    "2018 Q4 Selloff": ("2018-10-01", "2018-12-31"),
+    "2020 COVID": ("2020-02-01", "2020-04-30"),
+    "2022 Fed Hiking": ("2022-01-01", "2022-12-31"),
+    "2023 Banking": ("2023-03-01", "2023-05-31"),
+}
+
 ROLL_DATES = {
     "CDX IG": [
         "2015-03-20", "2015-09-21", "2016-03-21", "2016-09-20", "2017-03-20", "2017-09-20",
@@ -185,6 +209,10 @@ def run_pca_analysis(returns, num_pcs=1):
         expected += np.outer(pca_scores[:, i], beta)
     residuals = data_scaled - expected
     z_scores = pd.DataFrame((residuals - residuals.mean(axis=0)) / residuals.std(axis=0), index=returns.index, columns=returns.columns)
+    # FLIP credit z-scores so that POSITIVE = RICH for ALL assets
+    # Without flip: positive residual for credit = widened more than expected = CHEAP
+    # After flip: positive z-score for credit = RICH (spreads too tight)
+    # This makes interpretation consistent: positive Z = rich, negative Z = cheap
     for asset in credit:
         if asset in z_scores.columns:
             z_scores[asset] = -z_scores[asset]
@@ -208,6 +236,47 @@ def get_ranking(z_scores, credit, as_of_date=None):
     df["Rank"] = range(1, len(df) + 1)
     return df[["Rank", "Asset", "Type", "Z-Score", "Signal"]]
 
+def format_trade_action(asset, position, asset_type):
+    """
+    Format trade action with proper buy/sell protection terminology.
+
+    Z-SCORE CONVENTION (after credit flip in run_pca_analysis):
+      - POSITIVE Z = RICH = asset outperformed vs model = expect mean-reversion DOWN
+      - NEGATIVE Z = CHEAP = asset underperformed vs model = expect mean-reversion UP
+
+    For Credit (spreads in bps):
+      - RICH (positive Z) = spreads are TIGHTER than model expects
+        → Expect spreads to WIDEN back to fair value
+        → BUY protection to profit from widening
+      - CHEAP (negative Z) = spreads are WIDER than model expects
+        → Expect spreads to TIGHTEN back to fair value
+        → SELL protection to profit from tightening
+
+    For Equity (prices):
+      - RICH (positive Z) = price is HIGHER than model expects
+        → Expect price to FALL back to fair value
+        → SELL index to profit from falling
+      - CHEAP (negative Z) = price is LOWER than model expects
+        → Expect price to RISE back to fair value
+        → BUY index to profit from rising
+
+    Parameters:
+      position: 'short' (the rich asset) or 'long' (the cheap asset)
+      asset_type: 'Credit' or 'Equity'
+    """
+    if asset_type == "Credit":
+        if position == "short":
+            # Rich credit = tight spreads, expect widening, buy protection to profit
+            return f"Buy Protection on {asset}"
+        else:
+            # Cheap credit = wide spreads, expect tightening, sell protection to profit
+            return f"Sell Protection on {asset}"
+    else:  # Equity
+        if position == "short":
+            return f"Sell {asset}"
+        else:
+            return f"Buy {asset}"
+
 def get_rv_opportunities(ranking):
     opps = {}
     for asset_type in ["Credit", "Equity"]:
@@ -215,151 +284,438 @@ def get_rv_opportunities(ranking):
         if len(subset) >= 2:
             rich = subset.iloc[0]
             cheap = subset.iloc[-1]
-            opps[f"{asset_type} RV"] = {"Short": rich["Asset"], "Short Z": rich["Z-Score"], "Long": cheap["Asset"], "Long Z": cheap["Z-Score"], "Spread": rich["Z-Score"] - cheap["Z-Score"]}
+            opps[f"{asset_type} RV"] = {
+                "Short": rich["Asset"],
+                "Short Z": rich["Z-Score"],
+                "Long": cheap["Asset"],
+                "Long Z": cheap["Z-Score"],
+                "Spread": rich["Z-Score"] - cheap["Z-Score"],
+                "Short Action": format_trade_action(rich["Asset"], "short", asset_type),
+                "Long Action": format_trade_action(cheap["Asset"], "long", asset_type),
+            }
     return opps
 
 # ============================================================================
-# BLOOMBERG-STYLE Z-SCORE CHARTS
+# HTML/SVG CHART FUNCTIONS (Template-based dark theme)
 # ============================================================================
 
+def _generate_chart_id():
+    """Generate unique ID for each chart instance."""
+    import random
+    return f"chart_{random.randint(100000, 999999)}"
+
+def _svg_chart_base(chart_id, width, height, margin, title, subtitle=""):
+    """Generate base SVG chart container with dark theme styling."""
+    return f'''<div id="{chart_id}_container" style="background:{COLORS['pageBg']};color:{COLORS['textSecondary']};
+        font-family:'IBM Plex Mono',SF Mono,monospace;padding:16px;border-radius:8px;">
+    <h3 style="font-size:16px;font-weight:600;color:{COLORS['textPrimary']};margin:0 0 4px 0;">{title}</h3>
+    <p style="font-size:11px;color:{COLORS['textMuted']};margin:0 0 12px 0;">{subtitle}</p>
+    <div style="background:{COLORS['chartBg']};border-radius:6px;padding:12px;border:1px solid {COLORS['panelBorder']};">
+    <svg id="{chart_id}" viewBox="0 0 {width} {height}" style="width:100%;height:auto;display:block;cursor:crosshair;">
+    <defs><clipPath id="{chart_id}_clip"><rect x="{margin['left']}" y="{margin['top']}"
+        width="{width-margin['left']-margin['right']}" height="{height-margin['top']-margin['bottom']}"/></clipPath></defs>'''
+
+def _svg_chart_close():
+    return '</svg></div></div>'
+
+def _svg_interactive_layer(chart_id, width, height, margin, x_min, x_max, y_min, y_max, data_json, x_label, y_label):
+    """Add interactive crosshair and tooltip with JavaScript."""
+    PW = width - margin['left'] - margin['right']
+    PH = height - margin['top'] - margin['bottom']
+
+    return f'''
+    <!-- Interactive elements -->
+    <line id="{chart_id}_vline" x1="0" x2="0" y1="{margin['top']}" y2="{margin['top']+PH}"
+          stroke="#555" stroke-width="1" stroke-dasharray="3,3" visibility="hidden"/>
+    <line id="{chart_id}_hline" x1="{margin['left']}" x2="{margin['left']+PW}" y1="0" y2="0"
+          stroke="{COLORS['purple']}" stroke-width="1" stroke-dasharray="3,3" opacity="0.6" visibility="hidden"/>
+    <circle id="{chart_id}_hover_dot" cx="0" cy="0" r="5" fill="{COLORS['purple']}" stroke="#fff" stroke-width="1.5" visibility="hidden"/>
+    <g id="{chart_id}_tooltip" visibility="hidden">
+        <rect x="0" y="0" width="130" height="55" rx="4" fill="#181825" stroke="#333" opacity="0.95"/>
+        <text id="{chart_id}_tt_x" x="8" y="18" font-size="11" fill="{COLORS['textMuted']}">{x_label}: <tspan id="{chart_id}_tt_xval" fill="#fff">0</tspan></text>
+        <text id="{chart_id}_tt_y" x="8" y="36" font-size="11" fill="{COLORS['textMuted']}">{y_label}: <tspan id="{chart_id}_tt_yval" fill="{COLORS['purple']}">0</tspan></text>
+        <text id="{chart_id}_tt_date" x="8" y="50" font-size="10" fill="{COLORS['textDim']}"></text>
+    </g>
+    <rect id="{chart_id}_overlay" x="{margin['left']}" y="{margin['top']}" width="{PW}" height="{PH}"
+          fill="transparent" style="pointer-events:all;"/>
+    </svg></div></div>
+    <script>
+    (function() {{
+        const svg = document.getElementById('{chart_id}');
+        const overlay = document.getElementById('{chart_id}_overlay');
+        const vline = document.getElementById('{chart_id}_vline');
+        const hline = document.getElementById('{chart_id}_hline');
+        const dot = document.getElementById('{chart_id}_hover_dot');
+        const tooltip = document.getElementById('{chart_id}_tooltip');
+        const ttXval = document.getElementById('{chart_id}_tt_xval');
+        const ttYval = document.getElementById('{chart_id}_tt_yval');
+        const ttDate = document.getElementById('{chart_id}_tt_date');
+
+        const W = {width}, H = {height};
+        const M = {{left: {margin['left']}, top: {margin['top']}, right: {margin['right']}, bottom: {margin['bottom']}}};
+        const PW = W - M.left - M.right, PH = H - M.top - M.bottom;
+        const X_MIN = {x_min}, X_MAX = {x_max}, Y_MIN = {y_min}, Y_MAX = {y_max};
+        const data = {data_json};
+
+        function sx(v) {{ return M.left + (v - X_MIN) / (X_MAX - X_MIN) * PW; }}
+        function sy(v) {{ return M.top + (1 - (v - Y_MIN) / (Y_MAX - Y_MIN)) * PH; }}
+        function invX(px) {{ return X_MIN + (px - M.left) / PW * (X_MAX - X_MIN); }}
+        function invY(py) {{ return Y_MAX - (py - M.top) / PH * (Y_MAX - Y_MIN); }}
+
+        function findNearest(mouseX, mouseY) {{
+            let minDist = Infinity, nearest = null;
+            for (let i = 0; i < data.length; i++) {{
+                const dx = sx(data[i].x) - mouseX;
+                const dy = sy(data[i].y) - mouseY;
+                const dist = dx*dx + dy*dy;
+                if (dist < minDist) {{ minDist = dist; nearest = data[i]; }}
+            }}
+            return nearest;
+        }}
+
+        overlay.addEventListener('mousemove', function(e) {{
+            const rect = svg.getBoundingClientRect();
+            const scaleX = W / rect.width;
+            const mouseX = (e.clientX - rect.left) * scaleX;
+            const mouseY = (e.clientY - rect.top) * scaleX;
+
+            if (mouseX < M.left || mouseX > M.left + PW || mouseY < M.top || mouseY > M.top + PH) {{
+                vline.setAttribute('visibility', 'hidden');
+                hline.setAttribute('visibility', 'hidden');
+                dot.setAttribute('visibility', 'hidden');
+                tooltip.setAttribute('visibility', 'hidden');
+                return;
+            }}
+
+            const nearest = findNearest(mouseX, mouseY);
+            if (!nearest) return;
+
+            const px = sx(nearest.x), py = sy(nearest.y);
+
+            vline.setAttribute('x1', px);
+            vline.setAttribute('x2', px);
+            vline.setAttribute('visibility', 'visible');
+
+            hline.setAttribute('y1', py);
+            hline.setAttribute('y2', py);
+            hline.setAttribute('visibility', 'visible');
+
+            dot.setAttribute('cx', px);
+            dot.setAttribute('cy', py);
+            dot.setAttribute('visibility', 'visible');
+
+            ttXval.textContent = nearest.x.toFixed(2);
+            ttYval.textContent = nearest.y.toFixed(2);
+            ttDate.textContent = nearest.date || '';
+
+            const ttX = Math.min(px + 12, W - 140);
+            const ttY = Math.max(py - 60, M.top + 5);
+            tooltip.setAttribute('transform', 'translate(' + ttX + ',' + ttY + ')');
+            tooltip.setAttribute('visibility', 'visible');
+        }});
+
+        overlay.addEventListener('mouseleave', function() {{
+            vline.setAttribute('visibility', 'hidden');
+            hline.setAttribute('visibility', 'hidden');
+            dot.setAttribute('visibility', 'hidden');
+            tooltip.setAttribute('visibility', 'hidden');
+        }});
+    }})();
+    </script>'''
+
 def create_zscore_scatter(z_scores, asset1, asset2, lookback=756):
-    """Bloomberg-style Z-Score scatter chart with interactive tooltips"""
+    """Z-Score scatter chart as HTML/SVG with dark theme and interactivity."""
+    import json
     recent = z_scores.iloc[-lookback:]
     x_data = recent[asset1].values
     y_data = recent[asset2].values
     dates = recent.index
-
-    x_scale = bqp.LinearScale(min=-4, max=4)
-    y_scale = bqp.LinearScale(min=-4, max=4)
-
-    # Time gradient colors
     n_pts = len(x_data)
-    colors = np.linspace(0.3, 1.0, n_pts)
-    color_scale = bqp.ColorScale(colors=["#c0c0c0", "#1a1a2e"])
 
-    # Build tooltip labels with dates
-    date_labels = [d.strftime('%d%b%y') for d in dates]
+    # Chart dimensions
+    W, H = 700, 500
+    M = {"top": 30, "right": 40, "bottom": 50, "left": 55}
+    PW, PH = W - M["left"] - M["right"], H - M["top"] - M["bottom"]
 
-    scatter = bqp.Scatter(x=x_data, y=y_data, scales={'x': x_scale, 'y': y_scale, 'color': color_scale},
-                          color=colors, default_size=8, opacities=[0.6]*n_pts,
-                          names=date_labels, display_names=True)
-    scatter.tooltip = bqp.Tooltip(fields=['names', 'x', 'y'], formats=['', '.2f', '.2f'],
-                                   labels=['Date', f'{asset1} Z', f'{asset2} Z'])
+    # Scale functions
+    X_MIN, X_MAX, Y_MIN, Y_MAX = -4, 4, -4, 4
+    def sx(v): return M["left"] + (v - X_MIN) / (X_MAX - X_MIN) * PW
+    def sy(v): return M["top"] + (1 - (v - Y_MIN) / (Y_MAX - Y_MIN)) * PH
 
-    # Current point (diamond)
-    current = bqp.Scatter(x=[x_data[-1]], y=[y_data[-1]], scales={'x': x_scale, 'y': y_scale},
-                          colors=[COLORS["rich"]], default_size=80, marker="diamond")
-    current.tooltip = bqp.Tooltip(fields=['x', 'y'], formats=['.2f', '.2f'],
-                                   labels=[f'{asset1} Z', f'{asset2} Z'])
+    # Current values
+    curr_x, curr_y = x_data[-1], y_data[-1]
+    curr_date = dates[-1].strftime('%d%b%y')
 
-    # Reference lines: ±1 and ±2 z-scores
-    ref_lines = []
-    for val in [1, -1]:
-        ref_lines.append(bqp.Lines(x=[-4, 4], y=[val, val], scales={'x': x_scale, 'y': y_scale},
-                                    colors=["#ddd"], stroke_width=0.8, line_style="dashed"))
-        ref_lines.append(bqp.Lines(x=[val, val], y=[-4, 4], scales={'x': x_scale, 'y': y_scale},
-                                    colors=["#ddd"], stroke_width=0.8, line_style="dashed"))
-    for val in [2, -2]:
-        ref_lines.append(bqp.Lines(x=[-4, 4], y=[val, val], scales={'x': x_scale, 'y': y_scale},
-                                    colors=["#bbb"], stroke_width=1, line_style="dashed"))
-        ref_lines.append(bqp.Lines(x=[val, val], y=[-4, 4], scales={'x': x_scale, 'y': y_scale},
-                                    colors=["#bbb"], stroke_width=1, line_style="dashed"))
+    # Generate unique chart ID
+    chart_id = _generate_chart_id()
+
+    # Build data JSON for interactivity
+    data_list = [{"x": float(x_data[i]), "y": float(y_data[i]), "date": dates[i].strftime('%d%b%y')} for i in range(n_pts)]
+    data_json = json.dumps(data_list)
+
+    html = _svg_chart_base(chart_id, W, H, M, f"{asset1} vs {asset2} Z-Score",
+        f"Current: {asset1}={curr_x:.2f}, {asset2}={curr_y:.2f} ({curr_date})")
+
+    # Grid lines
+    for v in [-3, -2, -1, 0, 1, 2, 3]:
+        html += f'<line x1="{sx(X_MIN)}" x2="{sx(X_MAX)}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["gridLines"]}" stroke-width="0.5"/>'
+        html += f'<line x1="{sx(v)}" x2="{sx(v)}" y1="{sy(Y_MIN)}" y2="{sy(Y_MAX)}" stroke="{COLORS["gridLines"]}" stroke-width="0.5"/>'
+
+    # Reference lines at ±1 and ±2
+    for v in [1, -1]:
+        html += f'<line x1="{sx(X_MIN)}" x2="{sx(X_MAX)}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textDim"]}" stroke-width="0.8" stroke-dasharray="4,4"/>'
+        html += f'<line x1="{sx(v)}" x2="{sx(v)}" y1="{sy(Y_MIN)}" y2="{sy(Y_MAX)}" stroke="{COLORS["textDim"]}" stroke-width="0.8" stroke-dasharray="4,4"/>'
+    for v in [2, -2]:
+        html += f'<line x1="{sx(X_MIN)}" x2="{sx(X_MAX)}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textMuted"]}" stroke-width="1" stroke-dasharray="2,2"/>'
+        html += f'<line x1="{sx(v)}" x2="{sx(v)}" y1="{sy(Y_MIN)}" y2="{sy(Y_MAX)}" stroke="{COLORS["textMuted"]}" stroke-width="1" stroke-dasharray="2,2"/>'
+
+    # Axes
+    html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{M["top"]+PH}" y2="{M["top"]+PH}" stroke="#444"/>'
+    html += f'<line x1="{M["left"]}" x2="{M["left"]}" y1="{M["top"]}" y2="{M["top"]+PH}" stroke="#444"/>'
+
     # Zero lines
-    h_zero = bqp.Lines(x=[-4, 4], y=[0, 0], scales={'x': x_scale, 'y': y_scale},
-                       colors=["#888"], stroke_width=1, line_style="dotted")
-    v_zero = bqp.Lines(x=[0, 0], y=[-4, 4], scales={'x': x_scale, 'y': y_scale},
-                       colors=["#888"], stroke_width=1, line_style="dotted")
+    html += f'<line x1="{sx(0)}" x2="{sx(0)}" y1="{sy(Y_MIN)}" y2="{sy(Y_MAX)}" stroke="{COLORS["textMuted"]}" stroke-width="1"/>'
+    html += f'<line x1="{sx(X_MIN)}" x2="{sx(X_MAX)}" y1="{sy(0)}" y2="{sy(0)}" stroke="{COLORS["textMuted"]}" stroke-width="1"/>'
 
-    x_axis = bqp.Axis(scale=x_scale, label=f"{asset1} Z", grid_lines="none", tick_format=".0f")
-    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label=f"{asset2} Z", grid_lines="none", tick_format=".0f")
+    # Scatter points (time gradient: older = dimmer)
+    html += f'<g clip-path="url(#{chart_id}_clip)">'
+    for i in range(n_pts):
+        opacity = 0.3 + 0.5 * (i / n_pts)
+        html += f'<circle cx="{sx(x_data[i]):.1f}" cy="{sy(y_data[i]):.1f}" r="2.5" fill="{COLORS["scatterFill"]}" fill-opacity="{opacity:.2f}" stroke="{COLORS["scatterStroke"]}" stroke-width="0.5"/>'
+    html += '</g>'
 
-    fig = bqp.Figure(marks=ref_lines + [h_zero, v_zero, scatter, current],
-                     axes=[x_axis, y_axis],
-                     fig_margin={"top": 20, "bottom": 40, "left": 45, "right": 15},
-                     background_style={"fill": "#fafafa"})
-    fig.layout.width = "100%"
-    fig.layout.height = "340px"
+    # Current point (gold diamond)
+    cx, cy = sx(curr_x), sy(curr_y)
+    html += f'<polygon points="{cx-8},{cy} {cx},{cy-8} {cx+8},{cy} {cx},{cy+8}" fill="{COLORS["gold"]}" stroke="#000" stroke-width="1"/>'
+    html += f'<text x="{cx+12}" y="{cy+4}" font-size="10" fill="{COLORS["gold"]}">Current</text>'
 
-    return fig
+    # X-axis ticks and labels
+    for v in [-4, -3, -2, -1, 0, 1, 2, 3, 4]:
+        html += f'<line x1="{sx(v)}" x2="{sx(v)}" y1="{M["top"]+PH}" y2="{M["top"]+PH+5}" stroke="#444"/>'
+        html += f'<text x="{sx(v)}" y="{M["top"]+PH+18}" text-anchor="middle" font-size="10" fill="{COLORS["textDim"]}">{v}</text>'
 
-def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756):
-    """Bloomberg-style Z-Score spread time series with interactive tooltips"""
+    # Y-axis ticks and labels
+    for v in [-4, -3, -2, -1, 0, 1, 2, 3, 4]:
+        html += f'<line x1="{M["left"]-5}" x2="{M["left"]}" y1="{sy(v)}" y2="{sy(v)}" stroke="#444"/>'
+        html += f'<text x="{M["left"]-10}" y="{sy(v)+3}" text-anchor="end" font-size="10" fill="{COLORS["textDim"]}">{v}</text>'
+
+    # Axis titles
+    html += f'<text x="{M["left"]+PW/2}" y="{H-8}" text-anchor="middle" font-size="11" fill="{COLORS["textMuted"]}">{asset1} Z-Score</text>'
+    html += f'<text x="14" y="{M["top"]+PH/2}" text-anchor="middle" font-size="11" fill="{COLORS["textMuted"]}" transform="rotate(-90,14,{M["top"]+PH/2})">{asset2} Z-Score</text>'
+
+    # Add interactive layer with crosshair and tooltip
+    html += _svg_interactive_layer(chart_id, W, H, M, X_MIN, X_MAX, Y_MIN, Y_MAX, data_json, asset1, asset2)
+
+    return html
+
+def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_windows=None):
+    """Z-Score spread time series as HTML/SVG with dark theme and interactivity."""
+    import json
+    if ma_windows is None:
+        ma_windows = [20]  # Default to 20d MA
+
     recent = z_scores.iloc[-lookback:]
     spread = recent[asset1] - recent[asset2]
     dates = recent.index.tolist()
     y_data = spread.values
-    date_labels = [d.strftime('%d%b%y') for d in dates]
+    n_pts = len(y_data)
 
-    x_scale = bqp.DateScale()
+    # Calculate smoothed moving averages for each window
+    spread_series = pd.Series(y_data)
+    smoothed_lines = {}
+    for window in ma_windows:
+        smoothed_lines[window] = spread_series.rolling(window=window, min_periods=1).mean().values
+
+    # Chart dimensions
+    W, H = 700, 400
+    M = {"top": 30, "right": 40, "bottom": 50, "left": 55}
+    PW, PH = W - M["left"] - M["right"], H - M["top"] - M["bottom"]
+
+    # Scale functions
     y_min = max(-4, np.floor(y_data.min()) - 0.5)
     y_max = min(4, np.ceil(y_data.max()) + 0.5)
-    y_scale = bqp.LinearScale(min=y_min, max=y_max)
+    def sx(i): return M["left"] + i / (n_pts - 1) * PW
+    def sy(v): return M["top"] + (1 - (v - y_min) / (y_max - y_min)) * PH
 
-    # Line with scatter overlay for hover
-    line = bqp.Lines(x=dates, y=y_data, scales={'x': x_scale, 'y': y_scale},
-                     colors=[COLORS["primary"]], stroke_width=1.5)
+    # Stats
+    hi_idx, lo_idx = np.argmax(y_data), np.argmin(y_data)
+    curr_val = y_data[-1]
+    curr_date = dates[-1].strftime('%d%b%y')
 
-    # Invisible scatter for tooltips
-    scatter_hover = bqp.Scatter(x=dates, y=y_data, scales={'x': x_scale, 'y': y_scale},
-                                 colors=["transparent"], default_size=30, names=date_labels)
-    scatter_hover.tooltip = bqp.Tooltip(fields=['names', 'y'], formats=['', '.2f'],
-                                         labels=['Date', 'Z Spread'])
+    # Signal based on longest MA (most reliable)
+    longest_ma = max(ma_windows) if ma_windows else 20
+    smooth_curr = smoothed_lines.get(longest_ma, spread_series.rolling(window=20, min_periods=1).mean().values)[-1]
+    signal_color = COLORS["red"] if smooth_curr > 0 else COLORS["green"]
+    signal_text = "RICH" if smooth_curr > 0 else "CHEAP"
 
-    # Reference lines: ±1 and ±2
-    ref_lines = []
-    for val, col in [(1, "#ddd"), (-1, "#ddd"), (2, "#bbb"), (-2, "#bbb")]:
-        ref_lines.append(bqp.Lines(x=[dates[0], dates[-1]], y=[val, val], scales={'x': x_scale, 'y': y_scale},
-                                    colors=[col], stroke_width=0.8 if abs(val)==1 else 1, line_style="dashed"))
+    # Generate unique chart ID
+    chart_id = _generate_chart_id()
+
+    # Build data JSON for interactivity (use index as x for time series)
+    data_list = [{"x": float(i), "y": float(y_data[i]), "date": dates[i].strftime('%d%b%y')} for i in range(n_pts)]
+    data_json = json.dumps(data_list)
+
+    # Build subtitle showing MA values
+    ma_str = " | ".join([f"{w}d: {smoothed_lines[w][-1]:+.2f}" for w in sorted(ma_windows)])
+    html = _svg_chart_base(chart_id, W, H, M, f"{asset1} - {asset2} Z-Score Spread",
+        f"<tspan fill='{signal_color}' font-weight='600'>{signal_text}</tspan> | {ma_str} | Raw: {curr_val:+.2f} ({curr_date})")
+
+    # Grid lines
+    for v in np.arange(np.ceil(y_min), np.floor(y_max) + 1, 1):
+        html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["gridLines"]}" stroke-width="0.5"/>'
+
+    # Reference lines at ±1 and ±2
+    for v in [1, -1]:
+        if y_min <= v <= y_max:
+            html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textDim"]}" stroke-width="0.8" stroke-dasharray="4,4"/>'
+    for v in [2, -2]:
+        if y_min <= v <= y_max:
+            html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textMuted"]}" stroke-width="1" stroke-dasharray="2,2"/>'
+
     # Zero line
-    zero = bqp.Lines(x=[dates[0], dates[-1]], y=[0, 0], scales={'x': x_scale, 'y': y_scale},
-                     colors=["#888"], stroke_width=1, line_style="dotted")
+    if y_min <= 0 <= y_max:
+        html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(0)}" y2="{sy(0)}" stroke="{COLORS["textMuted"]}" stroke-width="1"/>'
 
-    x_axis = bqp.Axis(scale=x_scale, grid_lines="none")
-    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label="Z Spread", grid_lines="solid", grid_color="#eee", tick_format=".1f")
+    # Axes
+    html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{M["top"]+PH}" y2="{M["top"]+PH}" stroke="#444"/>'
+    html += f'<line x1="{M["left"]}" x2="{M["left"]}" y1="{M["top"]}" y2="{M["top"]+PH}" stroke="#444"/>'
 
-    fig = bqp.Figure(marks=ref_lines + [zero, line, scatter_hover], axes=[x_axis, y_axis],
-                     fig_margin={"top": 15, "bottom": 35, "left": 45, "right": 15},
-                     background_style={"fill": "#fafafa"})
-    fig.layout.width = "100%"
-    fig.layout.height = "280px"
+    # Build path for raw line (thinner, more transparent)
+    path_d = " ".join([f"{'M' if i==0 else 'L'}{sx(i):.1f},{sy(y_data[i]):.1f}" for i in range(n_pts)])
+    html += f'<path d="{path_d}" fill="none" stroke="{COLORS["cyan"]}" stroke-width="0.8" opacity="0.4" clip-path="url(#{chart_id}_clip)"/>'
 
-    return fig
+    # MA line colors
+    ma_colors = {5: COLORS["green"], 10: COLORS["orange"], 20: COLORS["purple"]}
+
+    # Build paths for each MA line
+    for window in sorted(ma_windows):
+        smoothed = smoothed_lines[window]
+        color = ma_colors.get(window, COLORS["purple"])
+        smooth_path_d = " ".join([f"{'M' if i==0 else 'L'}{sx(i):.1f},{sy(smoothed[i]):.1f}" for i in range(n_pts)])
+        html += f'<path d="{smooth_path_d}" fill="none" stroke="{color}" stroke-width="1.5" clip-path="url(#{chart_id}_clip)"/>'
+
+    # Legend
+    legend_x, legend_y = W - 100, M["top"] + 10
+    html += f'<line x1="{legend_x}" x2="{legend_x+15}" y1="{legend_y}" y2="{legend_y}" stroke="{COLORS["cyan"]}" stroke-width="1" opacity="0.5"/>'
+    html += f'<text x="{legend_x+20}" y="{legend_y+3}" font-size="9" fill="{COLORS["textDim"]}">Raw</text>'
+    legend_y += 12
+    for window in sorted(ma_windows):
+        color = ma_colors.get(window, COLORS["purple"])
+        html += f'<line x1="{legend_x}" x2="{legend_x+15}" y1="{legend_y}" y2="{legend_y}" stroke="{color}" stroke-width="1.5"/>'
+        html += f'<text x="{legend_x+20}" y="{legend_y+3}" font-size="9" fill="{COLORS["textMuted"]}">{window}d</text>'
+        legend_y += 12
+
+    # Current point marker (on longest MA line)
+    longest_smoothed = smoothed_lines[max(ma_windows)] if ma_windows else y_data
+    cx, cy = sx(n_pts-1), sy(longest_smoothed[-1])
+    html += f'<circle cx="{cx}" cy="{cy}" r="4" fill="{COLORS["gold"]}" stroke="#000" stroke-width="1"/>'
+
+    # X-axis labels (show ~6 dates)
+    step = max(1, n_pts // 6)
+    for i in range(0, n_pts, step):
+        html += f'<text x="{sx(i)}" y="{M["top"]+PH+18}" text-anchor="middle" font-size="9" fill="{COLORS["textDim"]}">{dates[i].strftime("%b%y")}</text>'
+
+    # Y-axis ticks and labels
+    for v in np.arange(np.ceil(y_min), np.floor(y_max) + 1, 1):
+        html += f'<line x1="{M["left"]-5}" x2="{M["left"]}" y1="{sy(v)}" y2="{sy(v)}" stroke="#444"/>'
+        html += f'<text x="{M["left"]-10}" y="{sy(v)+3}" text-anchor="end" font-size="10" fill="{COLORS["textDim"]}">{int(v)}</text>'
+
+    # Axis title
+    html += f'<text x="14" y="{M["top"]+PH/2}" text-anchor="middle" font-size="11" fill="{COLORS["textMuted"]}" transform="rotate(-90,14,{M["top"]+PH/2})">Z-Score Spread</text>'
+
+    # Add interactive layer
+    html += _svg_interactive_layer(chart_id, W, H, M, 0, n_pts-1, y_min, y_max, data_json, "Index", "Spread")
+
+    # Add stats panel below
+    html += create_zscore_stats_html(z_scores, asset1, asset2, lookback)
+
+    return html
 
 def create_zscore_stats_html(z_scores, asset1, asset2, lookback=756):
-    """Compact Bloomberg-style stats box for Z-Score spread"""
+    """Stats panel for Z-Score spread with dark theme."""
     recent = z_scores.iloc[-lookback:]
     spread = (recent[asset1] - recent[asset2]).values
     dates = recent.index
     hi, lo = np.argmax(spread), np.argmin(spread)
 
-    return f"""<div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:3px;padding:6px 10px;font-family:monospace;font-size:9px;display:inline-block;">
-    <table style="border-collapse:collapse;line-height:1.4;">
-    <tr><td style="padding-right:8px;"><b>First</b> {dates[0].strftime('%d%b%y')}</td><td style="text-align:right;padding-right:12px;">{spread[0]:.2f}</td>
-        <td style="padding-right:8px;"><b>Last</b> {dates[-1].strftime('%d%b%y')}</td><td style="text-align:right;">{spread[-1]:.2f}</td></tr>
-    <tr><td style="padding-right:8px;"><b>High</b> {dates[hi].strftime('%d%b%y')}</td><td style="text-align:right;padding-right:12px;">{spread[hi]:.2f}</td>
-        <td style="padding-right:8px;"><b>Low</b> {dates[lo].strftime('%d%b%y')}</td><td style="text-align:right;">{spread[lo]:.2f}</td></tr>
-    <tr><td style="padding-right:8px;"><b>Mean</b></td><td style="text-align:right;padding-right:12px;">{np.mean(spread):.2f}</td>
-        <td style="padding-right:8px;"><b>Std</b></td><td style="text-align:right;">{np.std(spread):.2f}</td></tr>
-    </table></div>"""
+    return f'''<div style="margin-top:12px;background:{COLORS['chartBg']};border-radius:6px;padding:12px 16px;
+        border:1px solid {COLORS['panelBorder']};font-family:'IBM Plex Mono',SF Mono,monospace;">
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;font-size:11px;">
+        <div><span style="color:{COLORS['textMuted']};">Current</span><br/>
+            <span style="color:{COLORS['cyan']};font-weight:600;font-size:13px;">{spread[-1]:.2f}</span>
+            <span style="color:{COLORS['textDim']};font-size:10px;"> ({dates[-1].strftime('%d%b%y')})</span></div>
+        <div><span style="color:{COLORS['textMuted']};">High</span><br/>
+            <span style="color:{COLORS['red']};font-weight:600;font-size:13px;">{spread[hi]:.2f}</span>
+            <span style="color:{COLORS['textDim']};font-size:10px;"> ({dates[hi].strftime('%d%b%y')})</span></div>
+        <div><span style="color:{COLORS['textMuted']};">Low</span><br/>
+            <span style="color:{COLORS['green']};font-weight:600;font-size:13px;">{spread[lo]:.2f}</span>
+            <span style="color:{COLORS['textDim']};font-size:10px;"> ({dates[lo].strftime('%d%b%y')})</span></div>
+        <div><span style="color:{COLORS['textMuted']};">Mean</span><br/>
+            <span style="color:{COLORS['textPrimary']};font-weight:600;">{np.mean(spread):.2f}</span></div>
+        <div><span style="color:{COLORS['textMuted']};">Median</span><br/>
+            <span style="color:{COLORS['textPrimary']};font-weight:600;">{np.median(spread):.2f}</span></div>
+        <div><span style="color:{COLORS['textMuted']};">Std Dev</span><br/>
+            <span style="color:{COLORS['textPrimary']};font-weight:600;">{np.std(spread):.2f}</span></div>
+    </div></div>'''
 
 # ============================================================================
 # REGIME MAP FUNCTIONS
 # ============================================================================
 
-def load_regime_data(start_date, end_date):
-    spx_request = bql.Request("SPX Index", {"PX": bq.data.px_last(dates=bq.func.range(start_date, end_date))})
-    spx_response = bq.execute(spx_request)
-    spx_df = spx_response.single().df().reset_index()
-    spx_df = spx_df[["DATE", "PX"]].rename(columns={"PX": "SPX"}).set_index("DATE")
+def get_beta_description(x_asset, y_asset, beta_value):
+    """
+    Format beta description based on asset types.
+    Beta is expressed as "1 unit of X = [beta] units of Y"
+    """
+    x_is_credit = x_asset in CREDIT_ASSETS
+    y_is_credit = y_asset in CREDIT_ASSETS
 
-    cdx_request = bql.Request("CDX IG CDSI GEN 5Y Corp", {"PX": bq.data.px_last(dates=bq.func.range(start_date, end_date))})
-    cdx_response = bq.execute(cdx_request)
-    cdx_df = cdx_response.single().df().reset_index()
-    cdx_df = cdx_df[["DATE", "PX"]].rename(columns={"PX": "CDX"}).set_index("DATE")
+    x_unit = "bp" if x_is_credit else "%"
+    y_unit = "bp" if y_is_credit else "%"
 
-    df = pd.concat([spx_df, cdx_df], axis=1).dropna()
-    df["SPX_MA200"] = df["SPX"].rolling(window=200).mean()
-    df["SPX_DEV"] = ((df["SPX"] / df["SPX_MA200"]) - 1) * 100
+    return f"1{x_unit} {x_asset} = {beta_value:.2f}{y_unit} {y_asset}"
+
+def load_regime_data(x_asset, y_asset, start_date, end_date):
+    """
+    Load data for any two assets for regime map.
+    For equity: calculate % deviation from 200d MA
+    For credit: use raw spread value
+    Returns df with columns: X_VALUE, Y_VALUE
+    """
+    # Load X-axis asset
+    x_ticker = ASSET_TICKERS.get(x_asset, x_asset)
+    x_request = bql.Request(x_ticker, {"PX": bq.data.px_last(dates=bq.func.range(start_date, end_date))})
+    x_response = bq.execute(x_request)
+    x_df = x_response.single().df().reset_index()
+    x_df = x_df[["DATE", "PX"]].rename(columns={"PX": "X_RAW"}).set_index("DATE")
+
+    # Load Y-axis asset
+    y_ticker = ASSET_TICKERS.get(y_asset, y_asset)
+    y_request = bql.Request(y_ticker, {"PX": bq.data.px_last(dates=bq.func.range(start_date, end_date))})
+    y_response = bq.execute(y_request)
+    y_df = y_response.single().df().reset_index()
+    y_df = y_df[["DATE", "PX"]].rename(columns={"PX": "Y_RAW"}).set_index("DATE")
+
+    df = pd.concat([x_df, y_df], axis=1).dropna()
+
+    # Process X-axis value
+    if x_asset in CREDIT_ASSETS:
+        # Credit: use raw spread value (bps)
+        df["X_VALUE"] = df["X_RAW"]
+    else:
+        # Equity: calculate % deviation from 200d MA
+        df["X_MA200"] = df["X_RAW"].rolling(window=200).mean()
+        df["X_VALUE"] = ((df["X_RAW"] / df["X_MA200"]) - 1) * 100
+
+    # Process Y-axis value
+    if y_asset in CREDIT_ASSETS:
+        # Credit: use raw spread value (bps)
+        df["Y_VALUE"] = df["Y_RAW"]
+    else:
+        # Equity: calculate % deviation from 200d MA
+        df["Y_MA200"] = df["Y_RAW"].rolling(window=200).mean()
+        df["Y_VALUE"] = ((df["Y_RAW"] / df["Y_MA200"]) - 1) * 100
+
     df = df.dropna()
     return df
 
@@ -391,25 +747,71 @@ def sigmoid_deriv(x, params):
     return -(ceiling - floor) * k * exp_term / (1 + exp_term) ** 2
 
 def fit_sigmoid(x_data, y_data):
+    """
+    Fit sigmoid curve with data-driven constraints.
+    Works for any asset pair (equity vs credit, credit vs credit, etc.)
+    """
+    # Calculate data-driven bounds
+    x_min, x_max = np.min(x_data), np.max(x_data)
+    y_min, y_max = np.min(y_data), np.max(y_data)
+    x_range = x_max - x_min
+    y_range = y_max - y_min
+    x_mean = np.mean(x_data)
+
+    # Floor/ceiling bounds based on Y data range (with some padding)
+    floor_min, floor_max = y_min - 0.1 * y_range, y_min + 0.3 * y_range
+    ceil_min, ceil_max = y_max - 0.3 * y_range, y_max + 0.1 * y_range
+    min_range = 0.3 * y_range  # Minimum floor-ceiling gap
+
+    # Midpoint bounds based on X data range
+    mid_min, mid_max = x_min - 0.2 * x_range, x_max + 0.2 * x_range
+
+    # Steepness bounds (scale with data)
+    k_scale = 1.0 / max(x_range, 1)  # Normalize by x range
+    k_min, k_max = 0.01 * k_scale, 5.0 * k_scale
+
     def cost(params):
         floor, ceiling, k, midpoint = params
-        if floor < 38 or floor > 60 or ceiling < 100 or ceiling > 300:
+        # Check bounds
+        if floor < floor_min or floor > floor_max:
             return 1e15
-        if k < 0.05 or k > 2.0 or midpoint < -25 or midpoint > 0:
+        if ceiling < ceil_min or ceiling > ceil_max:
             return 1e15
-        if ceiling - floor < 60:
+        if ceiling - floor < min_range:
+            return 1e15
+        if k < k_min or k > k_max:
+            return 1e15
+        if midpoint < mid_min or midpoint > mid_max:
             return 1e15
         return np.sum((sigmoid_val(x_data, params) - y_data) ** 2)
 
+    # Generate data-driven starting points
+    floor_start = y_min + 0.1 * y_range
+    ceil_start = y_max - 0.1 * y_range
+    k_start = 0.5 * k_scale
+    mid_start = x_mean
+
     starts = [
-        [48, 170, 0.15, -12], [47, 160, 0.20, -10], [50, 180, 0.25, -15],
-        [46, 200, 0.10, -8], [48, 150, 0.30, -18], [45, 190, 0.12, -14],
+        [floor_start, ceil_start, k_start, mid_start],
+        [floor_start * 0.95, ceil_start * 1.05, k_start * 0.5, mid_start - 0.1 * x_range],
+        [floor_start * 1.05, ceil_start * 0.95, k_start * 1.5, mid_start + 0.1 * x_range],
+        [floor_start, ceil_start, k_start * 2, mid_start],
+        [floor_start * 0.9, ceil_start * 1.1, k_start * 0.3, mid_start],
     ]
+
     best_result, best_cost = None, 1e15
     for start in starts:
-        result = minimize(cost, start, method='Nelder-Mead', options={'maxiter': 10000})
-        if result.fun < best_cost:
-            best_cost, best_result = result.fun, result.x
+        try:
+            result = minimize(cost, start, method='Nelder-Mead', options={'maxiter': 10000})
+            if result.fun < best_cost:
+                best_cost, best_result = result.fun, result.x
+        except:
+            continue
+
+    if best_result is None:
+        # Fallback to simple linear approximation
+        best_result = [floor_start, ceil_start, k_start, mid_start]
+
     return {"floor": best_result[0], "ceiling": best_result[1], "steepness": best_result[2], "midpoint": best_result[3]}
 
 def kernel_deriv(x_data, y_data, x_point, bandwidth=4, delta=0.01):
@@ -417,8 +819,28 @@ def kernel_deriv(x_data, y_data, x_point, bandwidth=4, delta=0.01):
     y_plus = regime_kernel(x_data, y_data, [x_point + delta], bandwidth)[0]
     return (y_plus - y_minus) / (2 * delta)
 
-def calc_beta_table(x_data, y_data, ols_result, sig_params, bandwidth=4):
-    x_mean, x_std = np.mean(x_data), np.std(x_data)
+def calc_beta_table(x_data, y_data, ols_result, sig_params, bandwidth=4, x_label="X", x_unit="%",
+                    sigma_x_data=None, model_for_ymove="Sigmoid"):
+    """
+    Calculate beta table with customizable sigma calculation and Y_Move model.
+
+    sigma_x_data: Optional subset of x_data to use for sigma calculation (e.g., stress periods)
+    model_for_ymove: "Sigmoid", "Kernel", or "OLS" - which model to use for Y_Move column
+    """
+    # Use provided sigma data or default to full x_data
+    sigma_data = sigma_x_data if sigma_x_data is not None else x_data
+    x_mean, x_std = np.mean(sigma_data), np.std(sigma_data)
+
+    sig_p = [sig_params["floor"], sig_params["ceiling"], sig_params["steepness"], sig_params["midpoint"]]
+
+    # Calculate Y at mean X position (reference point) using selected model
+    if model_for_ymove == "Sigmoid":
+        y_at_mean = sigmoid_val(x_mean, sig_p)
+    elif model_for_ymove == "Kernel":
+        y_at_mean = regime_kernel(x_data, y_data, [x_mean], bandwidth)[0]
+    else:  # OLS
+        y_at_mean = ols_result["intercept"] + ols_result["slope"] * x_mean
+
     points = [
         ("-3σ", x_mean - 3*x_std), ("-2σ", x_mean - 2*x_std), ("-1σ", x_mean - x_std),
         ("Mean", x_mean),
@@ -426,84 +848,218 @@ def calc_beta_table(x_data, y_data, ols_result, sig_params, bandwidth=4):
     ]
     rows = []
     for label, xp in points:
-        sig_p = [sig_params["floor"], sig_params["ceiling"], sig_params["steepness"], sig_params["midpoint"]]
+        # Calculate expected Y at this X point using selected model
+        if model_for_ymove == "Sigmoid":
+            y_at_point = sigmoid_val(xp, sig_p)
+        elif model_for_ymove == "Kernel":
+            y_at_point = regime_kernel(x_data, y_data, [xp], bandwidth)[0]
+        else:  # OLS
+            y_at_point = ols_result["intercept"] + ols_result["slope"] * xp
+
+        y_move = y_at_point - y_at_mean
+
         rows.append({
-            "Pt": label, "SPX%": f"{xp:.1f}",
+            "Shock": label,
+            "X_Val": f"{xp:.1f}",
+            "Y_Move": f"{y_move:+.1f}",
             "OLS": f"{ols_result['slope']:.2f}",
             "Kern": f"{kernel_deriv(x_data, y_data, xp, bandwidth):.2f}",
             "Sig": f"{sigmoid_deriv(xp, sig_p):.2f}",
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), x_mean, x_std
 
-def create_regime_chart(df, ols_result, kernel_y, sigmoid_y, x_grid, show_ols, show_kernel, show_sigmoid):
-    x_data, y_data = df["SPX_DEV"].values, df["CDX"].values
+def create_regime_chart(df, ols_result, kernel_y, sigmoid_y, x_grid, show_ols, show_kernel, show_sigmoid,
+                        x_asset="SPX Index", y_asset="CDX IG"):
+    """Regime Map as HTML/SVG with dark theme and interactivity. Works with any two assets."""
+    import json
+    x_data, y_data = df["X_VALUE"].values, df["Y_VALUE"].values
     dates = df.index
-    x_min, x_max = x_grid.min(), x_grid.max()
-    y_min = max(35, np.floor(y_data.min() / 5) * 5 - 5)
-    y_max = min(250, np.ceil(y_data.max() / 10) * 10 + 10)
-    x_scale, y_scale = bqp.LinearScale(min=x_min, max=x_max), bqp.LinearScale(min=y_min, max=y_max)
-
     n_pts = len(x_data)
-    colors = np.linspace(0.3, 1.0, n_pts)
-    color_scale = bqp.ColorScale(colors=["#c0c0c0", "#1a1a2e"])
-    date_labels = [d.strftime('%d%b%y') for d in dates]
 
-    scatter = bqp.Scatter(x=x_data, y=y_data, scales={'x': x_scale, 'y': y_scale, 'color': color_scale},
-                          color=colors, default_size=8, opacities=[0.6]*n_pts, names=date_labels)
-    scatter.tooltip = bqp.Tooltip(fields=['names', 'x', 'y'], formats=['', '.1f', '.1f'],
-                                   labels=['Date', 'SPX Dev%', 'CDX bps'])
+    # Determine units based on asset types
+    x_is_credit = x_asset in CREDIT_ASSETS
+    y_is_credit = y_asset in CREDIT_ASSETS
+    x_unit = "bp" if x_is_credit else "%"
+    y_unit = "bp" if y_is_credit else "%"
+    x_label = f"{x_asset} ({x_unit})" if x_is_credit else f"{x_asset} % Dev from 200d MA"
+    y_label = f"{y_asset} ({y_unit})" if y_is_credit else f"{y_asset} % Dev from 200d MA"
 
-    marks = [scatter]
+    # Chart dimensions
+    W, H = 800, 520
+    M = {"top": 30, "right": 40, "bottom": 60, "left": 60}
+    PW, PH = W - M["left"] - M["right"], H - M["top"] - M["bottom"]
+
+    # Scale bounds - dynamic based on data
+    x_min, x_max = x_grid.min(), x_grid.max()
+    y_range = y_data.max() - y_data.min()
+    y_padding = y_range * 0.1
+    y_min = y_data.min() - y_padding
+    y_max = y_data.max() + y_padding
+
+    def sx(v): return M["left"] + (v - x_min) / (x_max - x_min) * PW
+    def sy(v): return M["top"] + (1 - (v - y_min) / (y_max - y_min)) * PH
+
+    # Current values
+    curr_x, curr_y = x_data[-1], y_data[-1]
+    curr_date = dates[-1].strftime('%d%b%y')
+
+    # Generate unique chart ID
+    chart_id = _generate_chart_id()
+
+    # Build data JSON for interactivity
+    data_list = [{"x": float(x_data[i]), "y": float(y_data[i]), "date": dates[i].strftime('%d%b%y')} for i in range(n_pts)]
+    data_json = json.dumps(data_list)
+
+    # Build chart title and subtitle
+    chart_title = f"{x_asset} vs {y_asset} Regime Map"
+    chart_subtitle = f"Current: ({curr_x:.1f}{x_unit}, {curr_y:.1f}{y_unit}) {curr_date}"
+
+    html = _svg_chart_base(chart_id, W, H, M, chart_title, chart_subtitle)
+
+    # Grid lines
+    x_step = 5
+    for v in np.arange(np.ceil(x_min/x_step)*x_step, x_max+1, x_step):
+        html += f'<line x1="{sx(v)}" x2="{sx(v)}" y1="{M["top"]}" y2="{M["top"]+PH}" stroke="{COLORS["gridLines"]}" stroke-width="0.5"/>'
+    y_step = 20 if y_max - y_min > 100 else 10
+    for v in np.arange(np.ceil(y_min/y_step)*y_step, y_max+1, y_step):
+        html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["gridLines"]}" stroke-width="0.5"/>'
+
+    # Axes
+    html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{M["top"]+PH}" y2="{M["top"]+PH}" stroke="#444"/>'
+    html += f'<line x1="{M["left"]}" x2="{M["left"]}" y1="{M["top"]}" y2="{M["top"]+PH}" stroke="#444"/>'
+
+    # Zero line (vertical at x=0)
+    if x_min <= 0 <= x_max:
+        html += f'<line x1="{sx(0)}" x2="{sx(0)}" y1="{M["top"]}" y2="{M["top"]+PH}" stroke="{COLORS["textMuted"]}" stroke-width="1" stroke-dasharray="3,3"/>'
+
+    # Scatter points (time gradient: older = dimmer)
+    html += f'<g clip-path="url(#{chart_id}_clip)">'
+    for i in range(n_pts):
+        opacity = 0.3 + 0.5 * (i / n_pts)
+        html += f'<circle cx="{sx(x_data[i]):.1f}" cy="{sy(y_data[i]):.1f}" r="2.2" fill="{COLORS["scatterFill"]}" fill-opacity="{opacity:.2f}" stroke="{COLORS["scatterStroke"]}" stroke-width="0.5"/>'
+    html += '</g>'
+
+    # OLS line
     if show_ols:
-        ols_y = ols_result["intercept"] + ols_result["slope"] * x_grid
-        marks.append(bqp.Lines(x=x_grid, y=ols_y, scales={'x': x_scale, 'y': y_scale},
-                               colors=[COLORS["ols"]], stroke_width=1.5, line_style="dashed"))
+        ols_y_vals = ols_result["intercept"] + ols_result["slope"] * x_grid
+        path_d = " ".join([f"{'M' if i==0 else 'L'}{sx(x_grid[i]):.1f},{sy(ols_y_vals[i]):.1f}" for i in range(len(x_grid))])
+        html += f'<path d="{path_d}" fill="none" stroke="{COLORS["orange"]}" stroke-width="1.5" stroke-dasharray="5,3" clip-path="url(#{chart_id}_clip)" opacity="0.9"/>'
+
+    # Kernel line
     if show_kernel:
-        marks.append(bqp.Lines(x=x_grid, y=kernel_y, scales={'x': x_scale, 'y': y_scale},
-                               colors=[COLORS["kernel"]], stroke_width=2))
+        path_d = " ".join([f"{'M' if i==0 else 'L'}{sx(x_grid[i]):.1f},{sy(kernel_y[i]):.1f}" for i in range(len(x_grid))])
+        html += f'<path d="{path_d}" fill="none" stroke="{COLORS["cyan"]}" stroke-width="2.5" clip-path="url(#{chart_id}_clip)" opacity="0.95"/>'
+
+    # Sigmoid line
     if show_sigmoid:
-        marks.append(bqp.Lines(x=x_grid, y=sigmoid_y, scales={'x': x_scale, 'y': y_scale},
-                               colors=[COLORS["sigmoid"]], stroke_width=2))
-    # Zero line
-    marks.append(bqp.Lines(x=[0, 0], y=[y_min, y_max], scales={'x': x_scale, 'y': y_scale},
-                           colors=["#888"], stroke_width=1, line_style="dotted"))
+        path_d = " ".join([f"{'M' if i==0 else 'L'}{sx(x_grid[i]):.1f},{sy(sigmoid_y[i]):.1f}" for i in range(len(x_grid))])
+        html += f'<path d="{path_d}" fill="none" stroke="{COLORS["purple"]}" stroke-width="2.5" clip-path="url(#{chart_id}_clip)" opacity="0.95"/>'
 
-    x_axis = bqp.Axis(scale=x_scale, label="SPX % Dev from 200d MA", grid_lines="none", tick_format=".0f")
-    y_axis = bqp.Axis(scale=y_scale, orientation="vertical", label="CDX IG (bps)", grid_lines="solid", grid_color="#eee", tick_format=".0f")
+    # Current point (gold diamond)
+    cx, cy = sx(curr_x), sy(curr_y)
+    html += f'<polygon points="{cx-7},{cy} {cx},{cy-7} {cx+7},{cy} {cx},{cy+7}" fill="{COLORS["gold"]}" stroke="#000" stroke-width="1"/>'
+    html += f'<text x="{cx+12}" y="{cy+4}" font-size="10" fill="{COLORS["gold"]}">Current</text>'
 
-    fig = bqp.Figure(marks=marks, axes=[x_axis, y_axis],
-                     fig_margin={"top": 20, "bottom": 45, "left": 50, "right": 15},
-                     background_style={"fill": "#fafafa"})
-    fig.layout.width = "100%"
-    fig.layout.height = "420px"
-    return fig
+    # X-axis ticks and labels
+    for v in np.arange(np.ceil(x_min/x_step)*x_step, x_max+1, x_step):
+        html += f'<line x1="{sx(v)}" x2="{sx(v)}" y1="{M["top"]+PH}" y2="{M["top"]+PH+5}" stroke="#444"/>'
+        html += f'<text x="{sx(v)}" y="{M["top"]+PH+18}" text-anchor="middle" font-size="10" fill="{COLORS["textDim"]}">{int(v)}{x_unit}</text>'
 
-def create_regime_stats_html(df):
-    """Compact stats box for regime map"""
-    y = df["CDX"].values
+    # Y-axis ticks and labels
+    for v in np.arange(np.ceil(y_min/y_step)*y_step, y_max+1, y_step):
+        html += f'<line x1="{M["left"]-5}" x2="{M["left"]}" y1="{sy(v)}" y2="{sy(v)}" stroke="#444"/>'
+        html += f'<text x="{M["left"]-10}" y="{sy(v)+3}" text-anchor="end" font-size="10" fill="{COLORS["textDim"]}">{int(v)}</text>'
+
+    # Axis titles
+    html += f'<text x="{M["left"]+PW/2}" y="{H-12}" text-anchor="middle" font-size="11" fill="{COLORS["textMuted"]}">{x_label}</text>'
+    html += f'<text x="16" y="{M["top"]+PH/2}" text-anchor="middle" font-size="11" fill="{COLORS["textMuted"]}" transform="rotate(-90,16,{M["top"]+PH/2})">{y_label}</text>'
+
+    # Legend
+    legend_x, legend_y = W - 130, M["top"] + 10
+    if show_ols:
+        html += f'<line x1="{legend_x}" x2="{legend_x+20}" y1="{legend_y}" y2="{legend_y}" stroke="{COLORS["orange"]}" stroke-width="2" stroke-dasharray="5,3"/>'
+        html += f'<text x="{legend_x+25}" y="{legend_y+4}" font-size="10" fill="{COLORS["orange"]}">OLS</text>'
+        legend_y += 16
+    if show_kernel:
+        html += f'<line x1="{legend_x}" x2="{legend_x+20}" y1="{legend_y}" y2="{legend_y}" stroke="{COLORS["cyan"]}" stroke-width="2"/>'
+        html += f'<text x="{legend_x+25}" y="{legend_y+4}" font-size="10" fill="{COLORS["cyan"]}">Kernel</text>'
+        legend_y += 16
+    if show_sigmoid:
+        html += f'<line x1="{legend_x}" x2="{legend_x+20}" y1="{legend_y}" y2="{legend_y}" stroke="{COLORS["purple"]}" stroke-width="2"/>'
+        html += f'<text x="{legend_x+25}" y="{legend_y+4}" font-size="10" fill="{COLORS["purple"]}">Sigmoid</text>'
+
+    # Add interactive layer
+    html += _svg_interactive_layer(chart_id, W, H, M, x_min, x_max, y_min, y_max, data_json, x_asset, y_asset)
+
+    return html
+
+def create_regime_stats_html(df, x_asset="SPX Index", y_asset="CDX IG"):
+    """Stats panel for regime map with dark theme."""
+    y = df["Y_VALUE"].values
+    x = df["X_VALUE"].values
     dates = df.index
     hi, lo = np.argmax(y), np.argmin(y)
-    return f"""<div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:3px;padding:6px 10px;font-family:monospace;font-size:9px;display:inline-block;">
-    <table style="border-collapse:collapse;line-height:1.4;">
-    <tr><td style="padding-right:8px;"><b>First</b> {dates[0].strftime('%d%b%y')}</td><td style="text-align:right;padding-right:12px;">{y[0]:.0f}</td>
-        <td style="padding-right:8px;"><b>Last</b> {dates[-1].strftime('%d%b%y')}</td><td style="text-align:right;">{y[-1]:.0f}</td></tr>
-    <tr><td style="padding-right:8px;"><b>High</b> {dates[hi].strftime('%d%b%y')}</td><td style="text-align:right;padding-right:12px;">{y[hi]:.0f}</td>
-        <td style="padding-right:8px;"><b>Low</b> {dates[lo].strftime('%d%b%y')}</td><td style="text-align:right;">{y[lo]:.0f}</td></tr>
-    <tr><td style="padding-right:8px;"><b>Mean</b></td><td style="text-align:right;padding-right:12px;">{np.mean(y):.0f}</td>
-        <td style="padding-right:8px;"><b>Std</b></td><td style="text-align:right;">{np.std(y):.0f}</td></tr>
-    </table></div>"""
 
-def create_beta_table_html(beta_df):
-    """Compact beta table HTML"""
-    html = '<div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:3px;padding:6px 10px;font-family:monospace;font-size:9px;display:inline-block;margin-left:10px;">'
-    html += '<table style="border-collapse:collapse;line-height:1.4;"><tr style="border-bottom:1px solid #ccc;">'
-    html += '<th style="padding-right:8px;text-align:left;">Pt</th><th style="padding-right:8px;">SPX%</th>'
-    html += '<th style="padding-right:8px;color:#f97316;">OLS</th><th style="padding-right:8px;color:#22d3ee;">Kern</th><th style="color:#a78bfa;">Sig</th></tr>'
+    # Determine units based on asset types
+    x_is_credit = x_asset in CREDIT_ASSETS
+    y_is_credit = y_asset in CREDIT_ASSETS
+    x_unit = "bp" if x_is_credit else "%"
+    y_unit = "bp" if y_is_credit else "%"
+
+    return f'''<div style="margin-top:12px;background:{COLORS['chartBg']};border-radius:6px;padding:12px 16px;
+        border:1px solid {COLORS['panelBorder']};font-family:'IBM Plex Mono',SF Mono,monospace;">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;font-size:11px;">
+        <div><span style="color:{COLORS['textMuted']};">Current {y_asset}</span><br/>
+            <span style="color:{COLORS['cyan']};font-weight:600;font-size:13px;">{y[-1]:.1f}</span>
+            <span style="color:{COLORS['textDim']};font-size:10px;"> {y_unit}</span></div>
+        <div><span style="color:{COLORS['textMuted']};">Current {x_asset}</span><br/>
+            <span style="color:{COLORS['purple']};font-weight:600;font-size:13px;">{x[-1]:.1f}</span>
+            <span style="color:{COLORS['textDim']};font-size:10px;"> {x_unit}</span></div>
+        <div><span style="color:{COLORS['textMuted']};">{y_asset} High</span><br/>
+            <span style="color:{COLORS['red']};font-weight:600;font-size:13px;">{y[hi]:.1f}</span>
+            <span style="color:{COLORS['textDim']};font-size:10px;"> ({dates[hi].strftime('%d%b%y')})</span></div>
+        <div><span style="color:{COLORS['textMuted']};">{y_asset} Low</span><br/>
+            <span style="color:{COLORS['green']};font-weight:600;font-size:13px;">{y[lo]:.1f}</span>
+            <span style="color:{COLORS['textDim']};font-size:10px;"> ({dates[lo].strftime('%d%b%y')})</span></div>
+    </div></div>'''
+
+def create_beta_table_html(beta_df, x_asset="SPX Index", y_asset="CDX IG",
+                          sigma_source="Full History", sigma_mean=0, sigma_std=1, model_name="Sigmoid"):
+    """Beta table with dark theme styling."""
+    # Determine units based on asset types
+    x_is_credit = x_asset in CREDIT_ASSETS
+    y_is_credit = y_asset in CREDIT_ASSETS
+    x_unit = "bp" if x_is_credit else "%"
+    y_unit = "bp" if y_is_credit else "%"
+
+    # Beta description: how Y moves per unit of X
+    beta_desc = f"Beta = {y_unit} {y_asset} per {x_unit} {x_asset}"
+    # Sigma source info
+    sigma_info = f"σ from: {sigma_source} | Mean: {sigma_mean:.1f}{x_unit}, 1σ: {sigma_std:.1f}{x_unit} | Y via: {model_name}"
+
+    html = f'''<div style="margin-top:12px;background:{COLORS['chartBg']};border-radius:6px;padding:12px 16px;
+        border:1px solid {COLORS['panelBorder']};font-family:'IBM Plex Mono',SF Mono,monospace;">
+    <div style="font-size:12px;color:{COLORS['purple']};font-weight:600;margin-bottom:4px;">Regime Betas</div>
+    <div style="font-size:10px;color:{COLORS['textMuted']};margin-bottom:4px;">{beta_desc}</div>
+    <div style="font-size:9px;color:{COLORS['textDim']};margin-bottom:8px;">{sigma_info}</div>
+    <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;font-size:11px;">
+        <div style="color:{COLORS['textMuted']};font-weight:600;">Shock</div>
+        <div style="color:{COLORS['textMuted']};font-weight:600;">{y_asset} Δ</div>
+        <div style="color:{COLORS['textMuted']};font-weight:600;">{x_asset}</div>
+        <div style="color:{COLORS['orange']};font-weight:600;">OLS</div>
+        <div style="color:{COLORS['cyan']};font-weight:600;">Kernel</div>
+        <div style="color:{COLORS['purple']};font-weight:600;">Sigmoid</div>'''
     for _, row in beta_df.iterrows():
-        html += f'<tr><td style="padding-right:8px;"><b>{row["Pt"]}</b></td><td style="padding-right:8px;text-align:right;">{row["SPX%"]}</td>'
-        html += f'<td style="padding-right:8px;text-align:right;">{row["OLS"]}</td><td style="padding-right:8px;text-align:right;">{row["Kern"]}</td>'
-        html += f'<td style="text-align:right;">{row["Sig"]}</td></tr>'
-    html += '</table></div>'
+        # Color Y_Move based on direction (green for tightening/falling, red for widening/rising)
+        y_move_val = float(row["Y_Move"])
+        y_move_color = COLORS['green'] if y_move_val < 0 else COLORS['red'] if y_move_val > 0 else COLORS['textDim']
+        html += f'''<div style="color:{COLORS['textSecondary']};">{row["Shock"]}</div>
+            <div style="color:{y_move_color};font-weight:600;">{row["Y_Move"]}</div>
+            <div style="color:{COLORS['textDim']};">{row["X_Val"]}</div>
+            <div style="color:{COLORS['orange']};">{row["OLS"]}</div>
+            <div style="color:{COLORS['cyan']};">{row["Kern"]}</div>
+            <div style="color:{COLORS['purple']};">{row["Sig"]}</div>'''
+    html += '</div></div>'
     return html
 
 # ============================================================================
@@ -526,6 +1082,8 @@ class AppState:
         self.regime_x_grid = None
         self.regime_kernel_y = None
         self.regime_sigmoid_y = None
+        self.regime_x_asset = "SPX Index"
+        self.regime_y_asset = "CDX IG"
 
 state = AppState()
 
@@ -570,9 +1128,28 @@ pair_asset1 = widgets.Dropdown(options=[], description="Asset 1:", layout=widget
 pair_asset2 = widgets.Dropdown(options=[], description="Asset 2:", layout=widgets.Layout(width="160px"),
                                 style={'description_width': '55px'})
 zscore_btn = widgets.Button(description="Update", button_style="info", layout=widgets.Layout(width="70px"))
+# MA selection for Z-Score spread chart
+zscore_ma_5d = widgets.Checkbox(value=False, description="5d", indent=False, layout=widgets.Layout(width="50px"))
+zscore_ma_10d = widgets.Checkbox(value=False, description="10d", indent=False, layout=widgets.Layout(width="55px"))
+zscore_ma_20d = widgets.Checkbox(value=True, description="20d", indent=False, layout=widgets.Layout(width="55px"))
 zscore_output = widgets.Output()
 
-# Regime Map controls
+# Regime Map controls - Asset selection (populated from selected assets)
+regime_x_asset = widgets.Dropdown(
+    options=[],
+    value=None,
+    description="X-Axis:",
+    style={'description_width': '45px'},
+    layout=widgets.Layout(width="150px")
+)
+regime_y_asset = widgets.Dropdown(
+    options=[],
+    value=None,
+    description="Y-Axis:",
+    style={'description_width': '45px'},
+    layout=widgets.Layout(width="150px")
+)
+
 regime_start = widgets.DatePicker(value=(datetime.now() - timedelta(days=365*10)).date(),
                                    layout=widgets.Layout(width="130px"))
 regime_end = widgets.DatePicker(value=datetime.now().date(), layout=widgets.Layout(width="130px"))
@@ -584,7 +1161,7 @@ regime_show_kernel = widgets.Checkbox(value=True, description="Kernel", indent=F
 regime_show_sigmoid = widgets.Checkbox(value=True, description="Sigmoid", indent=False, layout=widgets.Layout(width="80px"))
 regime_bandwidth = widgets.FloatSlider(value=4, min=1, max=10, step=0.5, description="BW:",
                                         style={'description_width': '25px'}, layout=widgets.Layout(width="140px"))
-regime_update_btn = widgets.Button(description="Update", button_style="info", layout=widgets.Layout(width="60px"))
+regime_update_btn = widgets.Button(description="Update", button_style="info", layout=widgets.Layout(width="75px"))
 
 regime_floor = widgets.FloatSlider(value=48, min=38, max=60, step=0.5, description="Floor:",
                                     style={'description_width': '40px'}, layout=widgets.Layout(width="140px"))
@@ -597,6 +1174,29 @@ regime_mid = widgets.FloatSlider(value=-12, min=-25, max=0, step=0.5, descriptio
 
 regime_chart_output = widgets.Output()
 regime_tables_output = widgets.Output()
+
+# Regime Betas customization
+regime_beta_model = widgets.Dropdown(
+    options=["Sigmoid", "Kernel", "OLS"],
+    value="Sigmoid",
+    description="Model:",
+    style={'description_width': '45px'},
+    layout=widgets.Layout(width="120px")
+)
+regime_sigma_lookback = widgets.Dropdown(
+    options=["Full History", "5Y", "3Y", "1Y", "6M"],
+    value="Full History",
+    description="σ Period:",
+    style={'description_width': '50px'},
+    layout=widgets.Layout(width="140px")
+)
+regime_stress_period = widgets.Dropdown(
+    options=["None"] + list(STRESS_PERIODS.keys()),
+    value="None",
+    description="Stress:",
+    style={'description_width': '45px'},
+    layout=widgets.Layout(width="150px")
+)
 
 # ============================================================================
 # CALLBACKS
@@ -638,11 +1238,21 @@ def on_load(b):
         state.returns = state.raw_data.pct_change().dropna()
         state.returns = state.returns.replace([np.inf, -np.inf], np.nan).dropna()
         print(f"Loaded {len(state.returns)} days for {len(state.selected_assets)} assets")
+        # Update Z-Score pair dropdowns
         pair_asset1.options = state.selected_assets
         pair_asset2.options = state.selected_assets
         if len(state.selected_assets) >= 2:
             pair_asset1.value = state.selected_assets[0]
             pair_asset2.value = state.selected_assets[1]
+        # Update Regime Map dropdowns
+        regime_x_asset.options = state.selected_assets
+        regime_y_asset.options = state.selected_assets
+        if len(state.selected_assets) >= 2:
+            # Default to first equity and first credit if available
+            equities = [a for a in state.selected_assets if a in EQUITY_ASSETS]
+            credits = [a for a in state.selected_assets if a in CREDIT_ASSETS]
+            regime_x_asset.value = equities[0] if equities else state.selected_assets[0]
+            regime_y_asset.value = credits[0] if credits else state.selected_assets[1]
 
 def on_run_tests(b):
     with tests_output:
@@ -684,7 +1294,7 @@ def on_run_pca(b):
         display(ranking)
         opps = get_rv_opportunities(ranking)
         for trade, d in opps.items():
-            display(HTML(f"<b>{trade}:</b> Short {d['Short']} ({d['Short Z']:+.2f}) / Long {d['Long']} ({d['Long Z']:+.2f}) | Spread: {d['Spread']:.2f}"))
+            display(HTML(f"<b>{trade}:</b> {d['Short Action']} ({d['Short Z']:+.2f}) vs {d['Long Action']} ({d['Long Z']:+.2f}) | Spread: {d['Spread']:.2f}"))
 
 def on_zscore_update(b):
     with zscore_output:
@@ -697,29 +1307,93 @@ def on_zscore_update(b):
             print("Select both assets")
             return
         z = state.pca_results["z_scores"]
-        display(HTML(f"<b style='font-size:11px;'>{a1} vs {a2}</b>"))
-        # Stacked charts
-        scatter_fig = create_zscore_scatter(z, a1, a2)
-        spread_fig = create_zscore_spread_chart(z, a1, a2)
-        display(scatter_fig)
-        display(spread_fig)
-        # Stats below
-        display(HTML(create_zscore_stats_html(z, a1, a2)))
+
+        # Build list of MA windows from checkboxes
+        ma_windows = []
+        if zscore_ma_5d.value:
+            ma_windows.append(5)
+        if zscore_ma_10d.value:
+            ma_windows.append(10)
+        if zscore_ma_20d.value:
+            ma_windows.append(20)
+        if not ma_windows:
+            ma_windows = [20]  # Default if none selected
+
+        # Display HTML/SVG charts
+        display(HTML(create_zscore_scatter(z, a1, a2)))
+        display(HTML(create_zscore_spread_chart(z, a1, a2, ma_windows=ma_windows)))
 
 def on_regime_load(b):
     with regime_load_output:
         clear_output(wait=True)
         print("Loading...")
     try:
-        state.regime_df = load_regime_data(regime_start.value.strftime("%Y-%m-%d"), regime_end.value.strftime("%Y-%m-%d"))
-        x_data, y_data = state.regime_df["SPX_DEV"].values, state.regime_df["CDX"].values
+        # Store selected assets in state
+        state.regime_x_asset = regime_x_asset.value
+        state.regime_y_asset = regime_y_asset.value
+
+        state.regime_df = load_regime_data(
+            state.regime_x_asset,
+            state.regime_y_asset,
+            regime_start.value.strftime("%Y-%m-%d"),
+            regime_end.value.strftime("%Y-%m-%d")
+        )
+        x_data, y_data = state.regime_df["X_VALUE"].values, state.regime_df["Y_VALUE"].values
         state.regime_ols = regime_ols(x_data, y_data)
         state.regime_sigmoid = fit_sigmoid(x_data, y_data)
-        regime_floor.value = state.regime_sigmoid["floor"]
-        regime_ceiling.value = state.regime_sigmoid["ceiling"]
-        regime_steep.value = state.regime_sigmoid["steepness"]
-        regime_mid.value = state.regime_sigmoid["midpoint"]
-        state.regime_x_grid = np.linspace(x_data.min() - 5, x_data.max() + 5, 300)
+
+        # Dynamically update slider bounds based on data
+        y_min, y_max = np.min(y_data), np.max(y_data)
+        y_range = max(y_max - y_min, 1)  # Avoid zero range
+        x_min, x_max = np.min(x_data), np.max(x_data)
+        x_range = max(x_max - x_min, 1)  # Avoid zero range
+
+        # Calculate new bounds
+        floor_min_new = y_min - 0.2 * y_range
+        floor_max_new = y_min + 0.5 * y_range
+        ceil_min_new = y_max - 0.5 * y_range
+        ceil_max_new = y_max + 0.2 * y_range
+        k_scale = 1.0 / max(x_range, 1)
+        steep_min_new = 0.01 * k_scale
+        steep_max_new = 5.0 * k_scale
+        mid_min_new = x_min - 0.3 * x_range
+        mid_max_new = x_max + 0.3 * x_range
+
+        # Reset sliders to wide range first to avoid min > max errors
+        # Then set to actual bounds
+        regime_floor.min = min(floor_min_new, regime_floor.min, 0)
+        regime_floor.max = max(floor_max_new, regime_floor.max, 1000)
+        regime_floor.min = floor_min_new
+        regime_floor.max = floor_max_new
+        regime_floor.step = max(y_range / 100, 0.1)
+
+        regime_ceiling.min = min(ceil_min_new, regime_ceiling.min, 0)
+        regime_ceiling.max = max(ceil_max_new, regime_ceiling.max, 1000)
+        regime_ceiling.min = ceil_min_new
+        regime_ceiling.max = ceil_max_new
+        regime_ceiling.step = max(y_range / 100, 0.1)
+
+        regime_steep.min = min(steep_min_new, regime_steep.min, 0.001)
+        regime_steep.max = max(steep_max_new, regime_steep.max, 10)
+        regime_steep.min = steep_min_new
+        regime_steep.max = steep_max_new
+        regime_steep.step = max(0.1 * k_scale, 0.001)
+
+        regime_mid.min = min(mid_min_new, regime_mid.min, -1000)
+        regime_mid.max = max(mid_max_new, regime_mid.max, 1000)
+        regime_mid.min = mid_min_new
+        regime_mid.max = mid_max_new
+        regime_mid.step = max(x_range / 100, 0.1)
+
+        # Now set values (clamped to bounds)
+        regime_floor.value = np.clip(state.regime_sigmoid["floor"], floor_min_new, floor_max_new)
+        regime_ceiling.value = np.clip(state.regime_sigmoid["ceiling"], ceil_min_new, ceil_max_new)
+        regime_steep.value = np.clip(state.regime_sigmoid["steepness"], steep_min_new, steep_max_new)
+        regime_mid.value = np.clip(state.regime_sigmoid["midpoint"], mid_min_new, mid_max_new)
+
+        # Create x_grid with appropriate padding
+        x_padding = x_range * 0.1
+        state.regime_x_grid = np.linspace(x_min - x_padding, x_max + x_padding, 300)
         state.regime_kernel_y = regime_kernel(x_data, y_data, state.regime_x_grid, regime_bandwidth.value)
         sig_p = [state.regime_sigmoid["floor"], state.regime_sigmoid["ceiling"], state.regime_sigmoid["steepness"], state.regime_sigmoid["midpoint"]]
         state.regime_sigmoid_y = sigmoid_val(state.regime_x_grid, sig_p)
@@ -732,26 +1406,78 @@ def on_regime_load(b):
             clear_output(wait=True)
             print(f"Error: {e}")
 
+def get_sigma_subset(df, lookback, stress_period):
+    """
+    Get subset of data for sigma calculation based on lookback period or stress period.
+    Returns (subset_x_data, sigma_source_label)
+    """
+    x_data = df["X_VALUE"].values
+
+    # If stress period is selected, use that
+    if stress_period != "None" and stress_period in STRESS_PERIODS:
+        start_str, end_str = STRESS_PERIODS[stress_period]
+        start_dt = pd.to_datetime(start_str)
+        end_dt = pd.to_datetime(end_str)
+        mask = (df.index >= start_dt) & (df.index <= end_dt)
+        if mask.sum() > 10:  # Need enough data points
+            return df.loc[mask, "X_VALUE"].values, stress_period
+        # Fall back to full if not enough data in stress period
+
+    # Otherwise use lookback period
+    if lookback == "Full History":
+        return x_data, "Full History"
+    elif lookback == "5Y":
+        return x_data[-252*5:] if len(x_data) > 252*5 else x_data, "5Y"
+    elif lookback == "3Y":
+        return x_data[-252*3:] if len(x_data) > 252*3 else x_data, "3Y"
+    elif lookback == "1Y":
+        return x_data[-252:] if len(x_data) > 252 else x_data, "1Y"
+    elif lookback == "6M":
+        return x_data[-126:] if len(x_data) > 126 else x_data, "6M"
+    else:
+        return x_data, "Full History"
+
 def update_regime_display():
     if state.regime_df is None:
         return
-    x_data, y_data = state.regime_df["SPX_DEV"].values, state.regime_df["CDX"].values
+    x_data, y_data = state.regime_df["X_VALUE"].values, state.regime_df["Y_VALUE"].values
     state.regime_kernel_y = regime_kernel(x_data, y_data, state.regime_x_grid, regime_bandwidth.value)
     sig_p = [regime_floor.value, regime_ceiling.value, regime_steep.value, regime_mid.value]
     state.regime_sigmoid_y = sigmoid_val(state.regime_x_grid, sig_p)
 
     with regime_chart_output:
         clear_output(wait=True)
-        fig = create_regime_chart(state.regime_df, state.regime_ols, state.regime_kernel_y, state.regime_sigmoid_y,
-                                   state.regime_x_grid, regime_show_ols.value, regime_show_kernel.value, regime_show_sigmoid.value)
-        display(fig)
+        chart_html = create_regime_chart(
+            state.regime_df, state.regime_ols, state.regime_kernel_y, state.regime_sigmoid_y,
+            state.regime_x_grid, regime_show_ols.value, regime_show_kernel.value, regime_show_sigmoid.value,
+            x_asset=state.regime_x_asset, y_asset=state.regime_y_asset
+        )
+        display(HTML(chart_html))
     with regime_tables_output:
         clear_output(wait=True)
         sig_params = {"floor": regime_floor.value, "ceiling": regime_ceiling.value, "steepness": regime_steep.value, "midpoint": regime_mid.value}
-        beta_df = calc_beta_table(x_data, y_data, state.regime_ols, sig_params, regime_bandwidth.value)
-        stats_html = create_regime_stats_html(state.regime_df)
-        beta_html = create_beta_table_html(beta_df)
-        display(HTML(f'<div style="display:flex;flex-wrap:wrap;align-items:flex-start;">{stats_html}{beta_html}</div>'))
+
+        # Get sigma subset based on user selection
+        sigma_x_data, sigma_source = get_sigma_subset(
+            state.regime_df,
+            regime_sigma_lookback.value,
+            regime_stress_period.value
+        )
+
+        # Calculate beta table with customization
+        beta_df, sigma_mean, sigma_std = calc_beta_table(
+            x_data, y_data, state.regime_ols, sig_params, regime_bandwidth.value,
+            sigma_x_data=sigma_x_data,
+            model_for_ymove=regime_beta_model.value
+        )
+
+        stats_html = create_regime_stats_html(state.regime_df, x_asset=state.regime_x_asset, y_asset=state.regime_y_asset)
+        beta_html = create_beta_table_html(
+            beta_df, x_asset=state.regime_x_asset, y_asset=state.regime_y_asset,
+            sigma_source=sigma_source, sigma_mean=sigma_mean, sigma_std=sigma_std,
+            model_name=regime_beta_model.value
+        )
+        display(HTML(stats_html + beta_html))
 
 def on_regime_update(b):
     update_regime_display()
@@ -772,6 +1498,9 @@ regime_update_btn.on_click(on_regime_update)
 regime_show_ols.observe(lambda c: update_regime_display(), names='value')
 regime_show_kernel.observe(lambda c: update_regime_display(), names='value')
 regime_show_sigmoid.observe(lambda c: update_regime_display(), names='value')
+regime_beta_model.observe(lambda c: update_regime_display(), names='value')
+regime_sigma_lookback.observe(lambda c: update_regime_display(), names='value')
+regime_stress_period.observe(lambda c: update_regime_display(), names='value')
 
 update_selected_display()
 
@@ -808,12 +1537,16 @@ tab4 = widgets.VBox([
     widgets.HTML("<h3>Charts</h3>"),
     # Z-Score Section
     widgets.HTML("<b style='font-size:11px;'>Z-Score Analysis</b>"),
-    widgets.HBox([pair_asset1, pair_asset2, zscore_btn]),
+    widgets.HBox([pair_asset1, pair_asset2, zscore_btn,
+                  widgets.HTML("<span style='font-size:9px;color:#888;margin:0 8px;'>MA:</span>"),
+                  zscore_ma_5d, zscore_ma_10d, zscore_ma_20d],
+                 layout=widgets.Layout(align_items="center")),
     zscore_output,
     widgets.HTML("<hr style='margin:8px 0;border-color:#ddd;'>"),
     # Regime Map Section - Controls bunched together
-    widgets.HTML("<b style='font-size:11px;'>Credit-Equity Regime Map (SPX vs CDX IG)</b>"),
-    widgets.HBox([widgets.HTML("<span style='font-size:10px;margin-right:5px;'>Date:</span>"),
+    widgets.HTML("<b style='font-size:11px;'>Regime Map</b>"),
+    widgets.HBox([regime_x_asset, regime_y_asset,
+                  widgets.HTML("<span style='font-size:10px;margin:0 5px;'>|</span>"),
                   regime_start, regime_end, regime_load_btn, regime_load_output],
                  layout=widgets.Layout(align_items="center")),
     widgets.HBox([regime_show_ols, regime_show_kernel, regime_show_sigmoid, regime_bandwidth, regime_update_btn],
@@ -822,6 +1555,10 @@ tab4 = widgets.VBox([
                   regime_floor, regime_ceiling, regime_steep, regime_mid],
                  layout=widgets.Layout(margin="2px 0", align_items="center")),
     regime_chart_output,
+    # Regime Betas customization row
+    widgets.HBox([widgets.HTML("<span style='font-size:9px;color:#888;margin-right:5px;'>Betas:</span>"),
+                  regime_beta_model, regime_sigma_lookback, regime_stress_period],
+                 layout=widgets.Layout(margin="4px 0", align_items="center")),
     regime_tables_output,
 ])
 
