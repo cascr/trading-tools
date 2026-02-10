@@ -193,7 +193,7 @@ def run_validation_tests(returns):
     results["Clustering"] = {"value": n_clusters, "status": "PASS" if 2 <= n_clusters <= 4 else "WARN"}
     return results
 
-def run_pca_analysis(returns, num_pcs=1):
+def run_pca_analysis(returns, num_pcs=1, zscore_window=60):
     credit = [a for a in returns.columns if a in CREDIT_ASSETS]
     equity = [a for a in returns.columns if a in EQUITY_ASSETS]
     returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
@@ -208,7 +208,23 @@ def run_pca_analysis(returns, num_pcs=1):
         beta = loadings[f"PC{i+1}"].values
         expected += np.outer(pca_scores[:, i], beta)
     residuals = data_scaled - expected
-    z_scores = pd.DataFrame((residuals - residuals.mean(axis=0)) / residuals.std(axis=0), index=returns.index, columns=returns.columns)
+
+    # Cumulate daily residuals into mispricing levels
+    # Each day's residual = how much the asset's return deviated from PC expectation
+    # Summing over time: persistent deviations compound, random noise cancels out
+    cumulative_residuals = pd.DataFrame(
+        np.cumsum(residuals, axis=0),
+        index=returns.index,
+        columns=returns.columns
+    )
+
+    # Rolling z-score of cumulative residuals
+    # "Is the current accumulated mispricing unusual relative to recent history?"
+    rolling_mean = cumulative_residuals.rolling(window=zscore_window).mean()
+    rolling_std = cumulative_residuals.rolling(window=zscore_window).std()
+    z_scores = (cumulative_residuals - rolling_mean) / rolling_std
+    z_scores = z_scores.dropna()
+
     # FLIP credit z-scores so that POSITIVE = RICH for ALL assets
     # Without flip: positive residual for credit = widened more than expected = CHEAP
     # After flip: positive z-score for credit = RICH (spreads too tight)
@@ -1114,6 +1130,8 @@ cohort_output = widgets.Output()
 # ============================================================================
 
 num_pcs = widgets.IntSlider(value=1, min=1, max=5, description="PCs:")
+zscore_window = widgets.IntSlider(value=60, min=20, max=252, step=5, description="Z Window:",
+                                   style={'description_width': '70px'}, layout=widgets.Layout(width="250px"))
 run_pca_btn = widgets.Button(description="Run PCA", button_style="primary")
 pca_output = widgets.Output()
 results_output = widgets.Output()
@@ -1284,7 +1302,7 @@ def on_run_pca(b):
         if state.returns is None:
             print("Load data first")
             return
-        state.pca_results = run_pca_analysis(state.returns, num_pcs=num_pcs.value)
+        state.pca_results = run_pca_analysis(state.returns, num_pcs=num_pcs.value, zscore_window=zscore_window.value)
         var = state.pca_results["variance"]
         print(f"PC1: {var.iloc[0]:.1%} | PC2: {var.iloc[1]:.1%} | PC3: {var.iloc[2]:.1%}")
     with results_output:
@@ -1528,7 +1546,8 @@ tab2 = widgets.VBox([
 
 tab3 = widgets.VBox([
     widgets.HTML("<h3>PCA Analysis</h3>"),
-    num_pcs, run_pca_btn, pca_output,
+    widgets.HBox([num_pcs, zscore_window]),
+    run_pca_btn, pca_output,
     widgets.HTML("<h4>Rankings</h4>"), results_output
 ])
 
