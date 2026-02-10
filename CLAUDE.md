@@ -20,6 +20,7 @@
 1. Rolling window PCA (replace static PCA)
 2. Backtest framework (measure historical Sharpe)
 3. Alert system (|Z| > 2 triggers)
+4. **Backtest Z-score MA smoothing** - Compare raw vs 5d/10d/20d MA signals to measure Sharpe improvement and optimal window
 
 ## User Context
 
