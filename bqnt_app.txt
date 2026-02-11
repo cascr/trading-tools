@@ -466,6 +466,7 @@ def check_roll_date_reminder():
     return False
 
 def get_all_roll_dates():
+    """Get exact roll dates for all credit indices."""
     all_dates = set()
     for dates in ROLL_DATES.values():
         all_dates.update(pd.to_datetime(dates))
@@ -598,11 +599,13 @@ def run_pca_analysis(returns, num_pcs=1, zscore_window=60, winsor_cap=3.0):
         columns=returns.columns
     )
 
-    # Rolling z-score of cumulative residuals
-    # "Is the current accumulated mispricing unusual relative to recent history?"
-    rolling_mean = cumulative_residuals.rolling(window=zscore_window).mean()
-    rolling_std = cumulative_residuals.rolling(window=zscore_window).std()
-    z_scores = (cumulative_residuals - rolling_mean) / rolling_std
+    # Exponentially weighted z-score of cumulative residuals
+    # EWM avoids the "cliff effect" of rolling windows: old observations fade gradually
+    # instead of dropping off suddenly, so z-scores don't jump overnight when nothing moved
+    # span parameter gives similar effective lookback to a rolling window but smooth
+    ewm_mean = cumulative_residuals.ewm(span=zscore_window).mean()
+    ewm_std = cumulative_residuals.ewm(span=zscore_window).std()
+    z_scores = (cumulative_residuals - ewm_mean) / ewm_std
     z_scores = z_scores.dropna()
 
     # FLIP credit z-scores so that POSITIVE = RICH for ALL assets
@@ -829,7 +832,7 @@ def create_zscore_scatter(z_scores, asset1, asset2, lookback=756):
     n_pts = len(x_data)
 
     # Chart dimensions
-    W, H = 700, 500
+    W, H = 700, 380
     M = {"top": 30, "right": 40, "bottom": 50, "left": 55}
     PW, PH = W - M["left"] - M["right"], H - M["top"] - M["bottom"]
 
@@ -934,7 +937,7 @@ def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_window
         smoothed_lines[window] = spread_series.rolling(window=window, min_periods=1).mean().values
 
     # Chart dimensions
-    W, H = 700, 400
+    W, H = 700, 300
     M = {"top": 30, "right": 40, "bottom": 50, "left": 55}
     PW, PH = W - M["left"] - M["right"], H - M["top"] - M["bottom"]
 
@@ -1075,6 +1078,101 @@ def create_zscore_stats_html(z_scores, asset1, asset2, lookback=756):
         <div><span style="color:{COLORS['textMuted']};">Std Dev</span><br/>
             <span style="color:{COLORS['textPrimary']};font-weight:600;">{np.std(spread):.2f}</span></div>
     </div></div>'''
+
+def create_zscore_legs_chart(z_scores, asset1, asset2, show_mode="Both", lookback=756):
+    """Individual Z-score time series for each leg of a pair, showing which asset drives the spread."""
+    import json
+    recent = z_scores.iloc[-lookback:]
+    y1_data = recent[asset1].values
+    y2_data = recent[asset2].values
+    dates = recent.index.tolist()
+    n_pts = len(dates)
+
+    # Chart dimensions
+    W, H = 700, 280
+    M = {"top": 30, "right": 40, "bottom": 50, "left": 55}
+    PW, PH = W - M["left"] - M["right"], H - M["top"] - M["bottom"]
+
+    # Fixed ±4 y-axis to match scatter chart
+    y_min, y_max = -4, 4
+    def sx(i): return M["left"] + i / (n_pts - 1) * PW
+    def sy(v): return M["top"] + (1 - (v - y_min) / (y_max - y_min)) * PH
+
+    show_a1 = show_mode in ("Both", asset1)
+    show_a2 = show_mode in ("Both", asset2)
+
+    chart_id = _generate_chart_id()
+
+    # Subtitle with current values
+    parts = []
+    if show_a1:
+        parts.append(f"<tspan fill='{COLORS['cyan']}'>{asset1}: {y1_data[-1]:+.2f}</tspan>")
+    if show_a2:
+        parts.append(f"<tspan fill='{COLORS['purple']}'>{asset2}: {y2_data[-1]:+.2f}</tspan>")
+    subtitle = " | ".join(parts) + f" ({dates[-1].strftime('%d%b%y')})"
+
+    html = _svg_chart_base(chart_id, W, H, M, "Individual Z-Scores", subtitle)
+
+    # Grid lines
+    for v in np.arange(np.ceil(y_min), np.floor(y_max) + 1, 1):
+        html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["gridLines"]}" stroke-width="0.5"/>'
+
+    # Reference lines at ±1 and ±2
+    for v in [1, -1]:
+        html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textDim"]}" stroke-width="0.8" stroke-dasharray="4,4"/>'
+    for v in [2, -2]:
+        html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textMuted"]}" stroke-width="1" stroke-dasharray="2,2"/>'
+
+    # Zero line
+    html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(0)}" y2="{sy(0)}" stroke="{COLORS["textMuted"]}" stroke-width="1"/>'
+
+    # Axes
+    html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{M["top"]+PH}" y2="{M["top"]+PH}" stroke="#444"/>'
+    html += f'<line x1="{M["left"]}" x2="{M["left"]}" y1="{M["top"]}" y2="{M["top"]+PH}" stroke="#444"/>'
+
+    # Asset 1 line (cyan)
+    if show_a1:
+        path_d = " ".join([f"{'M' if i==0 else 'L'}{sx(i):.1f},{sy(y1_data[i]):.1f}" for i in range(n_pts)])
+        html += f'<path d="{path_d}" fill="none" stroke="{COLORS["cyan"]}" stroke-width="1.5" clip-path="url(#{chart_id}_clip)"/>'
+        html += f'<circle cx="{sx(n_pts-1)}" cy="{sy(y1_data[-1])}" r="4" fill="{COLORS["cyan"]}" stroke="#000" stroke-width="1"/>'
+
+    # Asset 2 line (purple)
+    if show_a2:
+        path_d = " ".join([f"{'M' if i==0 else 'L'}{sx(i):.1f},{sy(y2_data[i]):.1f}" for i in range(n_pts)])
+        html += f'<path d="{path_d}" fill="none" stroke="{COLORS["purple"]}" stroke-width="1.5" clip-path="url(#{chart_id}_clip)"/>'
+        html += f'<circle cx="{sx(n_pts-1)}" cy="{sy(y2_data[-1])}" r="4" fill="{COLORS["purple"]}" stroke="#000" stroke-width="1"/>'
+
+    # Legend
+    legend_x, legend_y = W - 120, M["top"] + 10
+    if show_a1:
+        html += f'<line x1="{legend_x}" x2="{legend_x+15}" y1="{legend_y}" y2="{legend_y}" stroke="{COLORS["cyan"]}" stroke-width="1.5"/>'
+        html += f'<text x="{legend_x+20}" y="{legend_y+3}" font-size="9" fill="{COLORS["textMuted"]}">{asset1}</text>'
+        legend_y += 14
+    if show_a2:
+        html += f'<line x1="{legend_x}" x2="{legend_x+15}" y1="{legend_y}" y2="{legend_y}" stroke="{COLORS["purple"]}" stroke-width="1.5"/>'
+        html += f'<text x="{legend_x+20}" y="{legend_y+3}" font-size="9" fill="{COLORS["textMuted"]}">{asset2}</text>'
+
+    # X-axis labels
+    step = max(1, n_pts // 6)
+    for i in range(0, n_pts, step):
+        html += f'<text x="{sx(i)}" y="{M["top"]+PH+18}" text-anchor="middle" font-size="9" fill="{COLORS["textDim"]}">{dates[i].strftime("%b%y")}</text>'
+
+    # Y-axis ticks and labels
+    for v in np.arange(np.ceil(y_min), np.floor(y_max) + 1, 1):
+        html += f'<line x1="{M["left"]-5}" x2="{M["left"]}" y1="{sy(v)}" y2="{sy(v)}" stroke="#444"/>'
+        html += f'<text x="{M["left"]-10}" y="{sy(v)+3}" text-anchor="end" font-size="10" fill="{COLORS["textDim"]}">{int(v)}</text>'
+
+    # Axis title
+    html += f'<text x="14" y="{M["top"]+PH/2}" text-anchor="middle" font-size="11" fill="{COLORS["textMuted"]}" transform="rotate(-90,14,{M["top"]+PH/2})">Z-Score</text>'
+
+    # Interactive layer - hover shows primary visible asset
+    if show_a1:
+        hover_data = [{"x": float(i), "y": float(y1_data[i]), "date": dates[i].strftime('%d%b%y')} for i in range(n_pts)]
+    else:
+        hover_data = [{"x": float(i), "y": float(y2_data[i]), "date": dates[i].strftime('%d%b%y')} for i in range(n_pts)]
+    html += _svg_interactive_layer(chart_id, W, H, M, 0, n_pts-1, y_min, y_max, json.dumps(hover_data), "Index", "Z-Score")
+
+    return html
 
 # ============================================================================
 # REGIME MAP FUNCTIONS
@@ -1573,6 +1671,11 @@ zscore_ma_5d = widgets.Checkbox(value=False, description="5d", indent=False, lay
 zscore_ma_10d = widgets.Checkbox(value=False, description="10d", indent=False, layout=widgets.Layout(width="55px"))
 zscore_ma_20d = widgets.Checkbox(value=True, description="20d", indent=False, layout=widgets.Layout(width="55px"))
 zscore_output = widgets.Output()
+# Individual legs chart
+legs_dropdown = widgets.Dropdown(options=["Both"], value="Both", description="Leg:",
+                                  style={'description_width': '30px'}, layout=widgets.Layout(width="160px"))
+legs_chart_output = widgets.Output()
+zscore_spread_output = widgets.Output()
 
 # Regime Map controls - Asset selection (populated from selected assets)
 regime_x_asset = widgets.Dropdown(
@@ -1671,11 +1774,17 @@ def on_load(b):
             display(HTML("<div style='background:#fff3cd;padding:10px;border-radius:5px;margin-bottom:10px;'><b>⚠️ REMINDER:</b> Update ROLL_DATES list!</div>"))
         state.raw_data = load_data_bql(state.selected_assets, state.field_map, start_date.value.strftime("%Y-%m-%d"), end_date.value.strftime("%Y-%m-%d"))
         # Compute returns FIRST on full price data, THEN remove discontinuity dates
-        # Old approach: dropping roll dates from raw prices caused pct_change() to span
-        # the series gap (old series → new series = artificial multi-day return)
-        # New approach: pct_change() on full data isolates the artificial return to the
-        # roll date itself, then we surgically remove just that one-day artificial return
-        state.returns = state.raw_data.pct_change().dropna()
+        # This isolates artificial returns to the exact roll date for surgical removal
+        # Credit: absolute change (bps) — pct_change on a 50bp spread distorts signals
+        # Equity: percentage change — standard for price indices
+        credit_cols = [a for a in state.selected_assets if a in CREDIT_ASSETS]
+        equity_cols = [a for a in state.selected_assets if a in EQUITY_ASSETS]
+        state.returns = pd.DataFrame(index=state.raw_data.index)
+        for col in credit_cols:
+            state.returns[col] = state.raw_data[col].diff()
+        for col in equity_cols:
+            state.returns[col] = state.raw_data[col].pct_change()
+        state.returns = state.returns.iloc[1:]
         state.returns = state.returns.replace([np.inf, -np.inf], np.nan).dropna()
         discontinuity_dates = get_all_discontinuity_dates()
         dates_to_remove = state.returns.index.intersection(discontinuity_dates)
@@ -1751,28 +1860,57 @@ def on_run_pca(b):
         for trade, d in opps.items():
             display(HTML(f"<b>{trade}:</b> {d['Short Action']} ({d['Short Z']:+.2f}) vs {d['Long Action']} ({d['Long Z']:+.2f}) | Spread: {d['Spread']:.2f}"))
 
-def on_zscore_update(b):
-    with zscore_output:
+def update_legs_chart():
+    """Re-render just the individual legs chart (called by dropdown or full update)."""
+    with legs_chart_output:
         clear_output(wait=True)
         if state.pca_results is None:
-            print("Run PCA first")
             return
         a1, a2 = pair_asset1.value, pair_asset2.value
         if not a1 or not a2:
-            print("Select both assets")
             return
         z = state.pca_results["z_scores"]
+        display(HTML(create_zscore_legs_chart(z, a1, a2, legs_dropdown.value)))
 
-        # Build list of MA windows from checkboxes
-        ma_windows = []
-        if zscore_ma_5d.value:
-            ma_windows.append(5)
-        if zscore_ma_10d.value:
-            ma_windows.append(10)
-        if zscore_ma_20d.value:
-            ma_windows.append(20)
-        # Display HTML/SVG charts (empty list = raw only, no MA overlay)
+def on_zscore_update(b):
+    # Clear all z-score outputs
+    for out in [zscore_output, legs_chart_output, zscore_spread_output]:
+        with out:
+            clear_output(wait=True)
+
+    if state.pca_results is None:
+        with zscore_output:
+            print("Run PCA first")
+        return
+    a1, a2 = pair_asset1.value, pair_asset2.value
+    if not a1 or not a2:
+        with zscore_output:
+            print("Select both assets")
+        return
+    z = state.pca_results["z_scores"]
+
+    # Update legs dropdown options for selected pair
+    legs_dropdown.options = ["Both", a1, a2]
+    legs_dropdown.value = "Both"
+
+    # Scatter chart
+    with zscore_output:
         display(HTML(create_zscore_scatter(z, a1, a2)))
+
+    # Individual legs chart
+    update_legs_chart()
+
+    # Spread chart
+    ma_windows = []
+    if zscore_ma_5d.value:
+        ma_windows.append(5)
+    if zscore_ma_10d.value:
+        ma_windows.append(10)
+    if zscore_ma_20d.value:
+        ma_windows.append(20)
+    if not ma_windows:
+        ma_windows = [20]
+    with zscore_spread_output:
         display(HTML(create_zscore_spread_chart(z, a1, a2, ma_windows=ma_windows)))
 
 def on_regime_load(b):
@@ -1945,6 +2083,7 @@ run_tests_btn.on_click(on_run_tests)
 suggest_btn.on_click(on_suggest)
 run_pca_btn.on_click(on_run_pca)
 zscore_btn.on_click(on_zscore_update)
+legs_dropdown.observe(lambda c: update_legs_chart(), names='value')
 regime_load_btn.on_click(on_regime_load)
 regime_update_btn.on_click(on_regime_update)
 regime_show_ols.observe(lambda c: update_regime_display(), names='value')
@@ -1995,6 +2134,9 @@ tab4 = widgets.VBox([
                   zscore_ma_5d, zscore_ma_10d, zscore_ma_20d],
                  layout=widgets.Layout(align_items="center")),
     zscore_output,
+    widgets.HBox([legs_dropdown], layout=widgets.Layout(margin="4px 0")),
+    legs_chart_output,
+    zscore_spread_output,
     widgets.HTML("<hr style='margin:8px 0;border-color:#ddd;'>"),
     # Regime Map Section - Controls bunched together
     widgets.HTML("<b style='font-size:11px;'>Regime Map</b>"),
