@@ -96,6 +96,365 @@ ROLL_DATES = {
     ],
 }
 
+# Credit index reconstitution dates - when a defaulted name is removed from the basket
+# and the index begins trading as a new series. UPDATE THIS LIST as credit events occur.
+# Format: list of dates when the new series began trading (day after the default settlement)
+RECON_DATES = {
+    "CDX IG": [],
+    "CDX HY": [
+        "2023-11-09", "2024-09-25", "2026-01-15",
+    ],
+    "ITRX MAIN": [],
+    "ITRX XOVER": [
+        "2025-01-17", "2025-08-28",
+    ],
+}
+
+# ============================================================================
+# CALENDAR ALIGNMENT FILTERING
+# ============================================================================
+# Problem: When a market is closed on a holiday, Bloomberg carries forward the
+# previous day's price. pct_change() produces 0% for the closed market while
+# open markets have real returns. PCA interprets this mismatch as a genuine
+# residual, and np.cumsum() permanently accumulates it — causing extreme
+# z-score swings that don't reflect real market relationships.
+#
+# Solution: Two-layer filtering:
+#   Layer 1 (Database): Known holidays with per-market impact (closed/early_close/normal)
+#   Layer 2 (Safety Net): Detect any remaining stale 0% returns automatically
+# ============================================================================
+
+# Asset to market region/type mapping for calendar filtering
+ASSET_MARKET_MAP = {
+    "CDX IG":       {"region": "US", "type": "credit"},
+    "CDX HY":       {"region": "US", "type": "credit"},
+    "ITRX MAIN":    {"region": "EU", "type": "credit"},
+    "ITRX XOVER":   {"region": "EU", "type": "credit"},
+    "SPX Index":    {"region": "US", "type": "equity"},
+    "NDX Index":    {"region": "US", "type": "equity"},
+    "RTY Index":    {"region": "US", "type": "equity"},
+    "SX5E Index":   {"region": "EU", "type": "equity"},
+}
+
+# Manual / ad-hoc market holidays not covered by recurring rules
+# Add one-off closures here (funerals, weather, etc.)
+MARKET_HOLIDAYS = [
+    {"date": "2018-12-05", "region": "US", "rule": "George H.W. Bush funeral", "credit": "closed", "equity": "closed"},
+    {"date": "2025-01-09", "region": "US", "rule": "Jimmy Carter funeral", "credit": "closed", "equity": "closed"},
+]
+
+def compute_easter_date(year):
+    """Meeus/Jones/Butcher algorithm for Easter Sunday. Pure arithmetic, no packages."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return datetime(year, month, day).date()
+
+def _nth_weekday(year, month, weekday, n):
+    """Get the nth occurrence of a weekday in a month.
+    weekday: 0=Monday, 6=Sunday. n: 1=first, 2=second, etc."""
+    first_day = datetime(year, month, 1)
+    offset = (weekday - first_day.weekday()) % 7
+    return (first_day + timedelta(days=offset + 7 * (n - 1))).date()
+
+def _last_weekday(year, month, weekday):
+    """Get the last occurrence of a weekday in a month."""
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1)
+    else:
+        next_month = datetime(year, month + 1, 1)
+    last_day = next_month - timedelta(days=1)
+    offset = (last_day.weekday() - weekday) % 7
+    return (last_day - timedelta(days=offset)).date()
+
+def _adjust_weekend(d):
+    """US observed-holiday rule: Saturday → Friday, Sunday → Monday."""
+    wd = d.weekday()
+    if wd == 5:  # Saturday → observed Friday
+        return d - timedelta(days=1)
+    elif wd == 6:  # Sunday → observed Monday
+        return d + timedelta(days=1)
+    return d
+
+def generate_recurring_holidays(start_year, end_year):
+    """Auto-generate predictable recurring market holidays for each year.
+    Returns list of dicts in the same format as MARKET_HOLIDAYS.
+
+    Each entry captures the impact on credit and equity markets separately:
+      "closed"      = market fully closed, Bloomberg carries forward stale price
+      "early_close" = shortened session, partial real return
+      "normal"      = market open as usual
+    """
+    holidays = []
+
+    for year in range(start_year, end_year + 1):
+        easter = compute_easter_date(year)
+
+        # ── US HOLIDAYS ──────────────────────────────────────────────
+
+        # New Year's Day (Jan 1) — both credit and equity closed
+        nyd = _adjust_weekend(datetime(year, 1, 1).date())
+        holidays.append({"date": str(nyd), "region": "US", "rule": "New Year's Day",
+                         "credit": "closed", "equity": "closed"})
+
+        # MLK Day (3rd Monday Jan) — both closed
+        mlk = _nth_weekday(year, 1, 0, 3)
+        holidays.append({"date": str(mlk), "region": "US", "rule": "MLK Day",
+                         "credit": "closed", "equity": "closed"})
+
+        # Presidents Day (3rd Monday Feb) — both closed
+        pres = _nth_weekday(year, 2, 0, 3)
+        holidays.append({"date": str(pres), "region": "US", "rule": "Presidents Day",
+                         "credit": "closed", "equity": "closed"})
+
+        # Good Friday (Easter - 2) — credit early close, equity closed
+        gf = easter - timedelta(days=2)
+        holidays.append({"date": str(gf), "region": "US", "rule": "Good Friday",
+                         "credit": "early_close", "equity": "closed"})
+
+        # Memorial Day (last Monday May) — both closed
+        mem = _last_weekday(year, 5, 0)
+        holidays.append({"date": str(mem), "region": "US", "rule": "Memorial Day",
+                         "credit": "closed", "equity": "closed"})
+
+        # Juneteenth (Jun 19, federal holiday since 2021) — both closed
+        if year >= 2021:
+            jn = _adjust_weekend(datetime(year, 6, 19).date())
+            holidays.append({"date": str(jn), "region": "US", "rule": "Juneteenth",
+                             "credit": "closed", "equity": "closed"})
+
+        # Independence Day (Jul 4) — both closed
+        jul4 = _adjust_weekend(datetime(year, 7, 4).date())
+        holidays.append({"date": str(jul4), "region": "US", "rule": "Independence Day",
+                         "credit": "closed", "equity": "closed"})
+
+        # Day before Jul 4 (Jul 3) — early close if weekday
+        jul3 = datetime(year, 7, 3).date()
+        if jul3.weekday() < 5:
+            holidays.append({"date": str(jul3), "region": "US", "rule": "Day before Jul 4",
+                             "credit": "early_close", "equity": "early_close"})
+
+        # Labor Day (1st Monday Sep) — both closed
+        labor = _nth_weekday(year, 9, 0, 1)
+        holidays.append({"date": str(labor), "region": "US", "rule": "Labor Day",
+                         "credit": "closed", "equity": "closed"})
+
+        # Columbus Day (2nd Monday Oct) — equity closed, credit OPEN
+        columbus = _nth_weekday(year, 10, 0, 2)
+        holidays.append({"date": str(columbus), "region": "US", "rule": "Columbus Day",
+                         "credit": "normal", "equity": "closed"})
+
+        # Veterans Day (Nov 11) — equity closed, credit OPEN
+        vet = _adjust_weekend(datetime(year, 11, 11).date())
+        holidays.append({"date": str(vet), "region": "US", "rule": "Veterans Day",
+                         "credit": "normal", "equity": "closed"})
+
+        # Thanksgiving (4th Thursday Nov) — both closed
+        tg = _nth_weekday(year, 11, 3, 4)
+        holidays.append({"date": str(tg), "region": "US", "rule": "Thanksgiving",
+                         "credit": "closed", "equity": "closed"})
+
+        # Black Friday (day after Thanksgiving) — both early close
+        bf = tg + timedelta(days=1)
+        holidays.append({"date": str(bf), "region": "US", "rule": "Black Friday",
+                         "credit": "early_close", "equity": "early_close"})
+
+        # Christmas Eve (Dec 24) — early close if weekday
+        xmas_eve = datetime(year, 12, 24).date()
+        if xmas_eve.weekday() < 5:
+            holidays.append({"date": str(xmas_eve), "region": "US", "rule": "Christmas Eve",
+                             "credit": "early_close", "equity": "early_close"})
+
+        # Christmas Day (Dec 25) — both closed
+        xmas = _adjust_weekend(datetime(year, 12, 25).date())
+        holidays.append({"date": str(xmas), "region": "US", "rule": "Christmas Day",
+                         "credit": "closed", "equity": "closed"})
+
+        # New Year's Eve (Dec 31) — credit early close, equity normal, if weekday
+        nye = datetime(year, 12, 31).date()
+        if nye.weekday() < 5:
+            holidays.append({"date": str(nye), "region": "US", "rule": "New Year's Eve",
+                             "credit": "early_close", "equity": "normal"})
+
+        # ── EU HOLIDAYS ──────────────────────────────────────────────
+
+        # Good Friday (Easter - 2) — EU exchanges and iTraxx closed
+        holidays.append({"date": str(gf), "region": "EU", "rule": "Good Friday",
+                         "credit": "closed", "equity": "closed"})
+
+        # Easter Monday (Easter + 1) — both closed
+        em = easter + timedelta(days=1)
+        holidays.append({"date": str(em), "region": "EU", "rule": "Easter Monday",
+                         "credit": "closed", "equity": "closed"})
+
+        # May Day (May 1) — both closed if weekday
+        may1 = datetime(year, 5, 1).date()
+        if may1.weekday() < 5:
+            holidays.append({"date": str(may1), "region": "EU", "rule": "May Day",
+                             "credit": "closed", "equity": "closed"})
+
+        # Christmas Eve (Dec 24) — early close if weekday
+        if xmas_eve.weekday() < 5:
+            holidays.append({"date": str(xmas_eve), "region": "EU", "rule": "Christmas Eve",
+                             "credit": "early_close", "equity": "early_close"})
+
+        # Christmas Day (Dec 25) — closed if weekday (no observed-day shift in EU)
+        xmas_actual = datetime(year, 12, 25).date()
+        if xmas_actual.weekday() < 5:
+            holidays.append({"date": str(xmas_actual), "region": "EU", "rule": "Christmas Day",
+                             "credit": "closed", "equity": "closed"})
+
+        # Boxing Day (Dec 26) — closed if weekday
+        boxing = datetime(year, 12, 26).date()
+        if boxing.weekday() < 5:
+            holidays.append({"date": str(boxing), "region": "EU", "rule": "Boxing Day",
+                             "credit": "closed", "equity": "closed"})
+
+    return holidays
+
+def get_dates_to_filter(holidays_db, selected_assets):
+    """Determine which dates to remove based on selected assets and holiday calendar.
+
+    Removal logic (asset-aware):
+    - Remove if ANY selected asset was "closed" AND another was "normal" or "early_close"
+    - Remove if ANY selected asset had "early_close" AND another had "normal"
+    - Keep if ALL selected assets share the same status (no mismatch to contaminate PCA)
+
+    If user only selects US assets, EU holidays won't cause removals (no mismatch).
+    """
+    # Group holidays by date
+    date_holidays = {}
+    for h in holidays_db:
+        d = h["date"]
+        if d not in date_holidays:
+            date_holidays[d] = []
+        date_holidays[d].append(h)
+
+    dates_to_filter = []
+    audit_rows = []
+
+    for date_str, holiday_entries in date_holidays.items():
+        # For each selected asset, determine its market status on this date
+        asset_statuses = {}
+        for asset in selected_assets:
+            info = ASSET_MARKET_MAP.get(asset)
+            if info is None:
+                continue
+            region = info["region"]
+            asset_type = info["type"]
+
+            # Find the holiday entry matching this asset's region
+            status = "normal"
+            for h in holiday_entries:
+                if h["region"] == region:
+                    status = h[asset_type]
+                    break
+            asset_statuses[asset] = status
+
+        if not asset_statuses:
+            continue
+
+        # Check for mismatch across selected assets
+        unique_statuses = set(asset_statuses.values())
+
+        # All same status → no mismatch → keep
+        if len(unique_statuses) == 1:
+            continue
+
+        # Mixed statuses → check if the mismatch contaminates PCA
+        should_filter = False
+        if "closed" in unique_statuses and ("normal" in unique_statuses or "early_close" in unique_statuses):
+            should_filter = True
+        elif "early_close" in unique_statuses and "normal" in unique_statuses:
+            should_filter = True
+
+        if should_filter:
+            dt = pd.Timestamp(date_str)
+            dates_to_filter.append(dt)
+            regions = set(h["region"] for h in holiday_entries)
+            rules = ", ".join(set(h["rule"] for h in holiday_entries))
+            credit_impacts = set(h["credit"] for h in holiday_entries)
+            equity_impacts = set(h["equity"] for h in holiday_entries)
+            audit_rows.append({
+                "Date": dt,
+                "Day of Week": dt.strftime("%A"),
+                "Region": "/".join(sorted(regions)),
+                "Rule": rules,
+                "Credit Impact": "/".join(sorted(credit_impacts)),
+                "Equity Impact": "/".join(sorted(equity_impacts)),
+                "Filter Source": "database",
+            })
+
+    return dates_to_filter, audit_rows
+
+def detect_stale_returns(returns_df):
+    """Layer 2 safety net: detect days where SOME (not all) assets have ~0% returns.
+    A 0% return from pct_change() means Bloomberg carried forward a stale price.
+    This catches any holidays NOT in the database."""
+    stale_mask = returns_df.abs() < 1e-10
+    n_stale_per_day = stale_mask.sum(axis=1)
+    n_total = len(returns_df.columns)
+
+    # Only flag days where SOME (but not ALL) assets are stale → mismatch
+    # If ALL are stale, there's no mismatch (PCA sees consistent zero returns)
+    mismatch_mask = (n_stale_per_day > 0) & (n_stale_per_day < n_total)
+    mismatch_dates = returns_df.index[mismatch_mask]
+
+    audit_rows = []
+    for date in mismatch_dates:
+        stale_assets = list(returns_df.columns[stale_mask.loc[date]])
+        audit_rows.append({
+            "Date": date,
+            "Day of Week": date.strftime("%A"),
+            "Region": "Unknown",
+            "Rule": f"Stale: {', '.join(stale_assets)}",
+            "Credit Impact": "unknown",
+            "Equity Impact": "unknown",
+            "Filter Source": "stale-detection",
+        })
+
+    return list(mismatch_dates), audit_rows
+
+def filter_calendar_misalignment(returns_df, selected_assets, start_year, end_year):
+    """Orchestrate calendar filtering: database holidays + stale-return safety net.
+
+    Returns: (clean_returns, audit_df, n_database_filtered, n_stale_filtered)
+    """
+    # 1. Merge manual (ad-hoc) + auto-generated (recurring) holidays
+    all_holidays = MARKET_HOLIDAYS + generate_recurring_holidays(start_year, end_year)
+
+    # 2. Layer 1: Get dates to filter from holiday database
+    db_dates, db_audit = get_dates_to_filter(all_holidays, selected_assets)
+    db_timestamps = pd.DatetimeIndex(db_dates)
+    dates_in_data = returns_df.index.intersection(db_timestamps)
+    clean_returns = returns_df.drop(dates_in_data, errors="ignore")
+    n_db = len(dates_in_data)
+
+    # 3. Layer 2: Detect remaining stale returns the database missed
+    stale_dates, stale_audit = detect_stale_returns(clean_returns)
+    clean_returns = clean_returns.drop(stale_dates, errors="ignore")
+    n_stale = len(stale_dates)
+
+    # 4. Build combined audit log
+    all_audit = db_audit + stale_audit
+    if all_audit:
+        audit_df = pd.DataFrame(all_audit).sort_values("Date").reset_index(drop=True)
+    else:
+        audit_df = pd.DataFrame()
+
+    return clean_returns, audit_df, n_db, n_stale
+
 def check_roll_date_reminder():
     today = datetime.now()
     if (today.month == 3 and 15 <= today.day <= 31) or (today.month == 9 and 15 <= today.day <= 30):
@@ -111,6 +470,17 @@ def get_all_roll_dates():
     for dates in ROLL_DATES.values():
         all_dates.update(pd.to_datetime(dates))
     return all_dates
+
+def get_all_recon_dates():
+    """Get all credit index reconstitution dates (default-driven series changes)."""
+    all_dates = set()
+    for dates in RECON_DATES.values():
+        all_dates.update(pd.to_datetime(dates))
+    return all_dates
+
+def get_all_discontinuity_dates():
+    """Combine roll dates and reconstitution dates - both cause artificial jumps in spread data."""
+    return get_all_roll_dates() | get_all_recon_dates()
 
 def load_data_bql(assets, field_map, start_date, end_date):
     all_dfs = []
@@ -193,7 +563,7 @@ def run_validation_tests(returns):
     results["Clustering"] = {"value": n_clusters, "status": "PASS" if 2 <= n_clusters <= 4 else "WARN"}
     return results
 
-def run_pca_analysis(returns, num_pcs=1, zscore_window=60):
+def run_pca_analysis(returns, num_pcs=1, zscore_window=60, winsor_cap=3.0):
     credit = [a for a in returns.columns if a in CREDIT_ASSETS]
     equity = [a for a in returns.columns if a in EQUITY_ASSETS]
     returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
@@ -208,6 +578,16 @@ def run_pca_analysis(returns, num_pcs=1, zscore_window=60):
         beta = loadings[f"PC{i+1}"].values
         expected += np.outer(pca_scores[:, i], beta)
     residuals = data_scaled - expected
+
+    # Winsorize extreme daily residuals before cumsumming
+    # Without this, a single extreme day (FOMC, surprise event) injects an outsized
+    # value into cumsum that permanently distorts the cumulative residual level.
+    # winsor_cap=0 disables winsorization (no clipping)
+    if winsor_cap > 0:
+        residual_std = np.std(residuals, axis=0, keepdims=True)
+        residual_std = np.where(residual_std < 1e-10, 1.0, residual_std)  # safety floor
+        residual_clip = winsor_cap * residual_std
+        residuals = np.clip(residuals, -residual_clip, residual_clip)
 
     # Cumulate daily residuals into mispricing levels
     # Each day's residual = how much the asset's return deviated from PC expectation
@@ -453,8 +833,11 @@ def create_zscore_scatter(z_scores, asset1, asset2, lookback=756):
     M = {"top": 30, "right": 40, "bottom": 50, "left": 55}
     PW, PH = W - M["left"] - M["right"], H - M["top"] - M["bottom"]
 
-    # Scale functions
-    X_MIN, X_MAX, Y_MIN, Y_MAX = -4, 4, -4, 4
+    # Dynamic axis range — fits all data points with padding
+    data_extent = max(np.abs(x_data).max(), np.abs(y_data).max(), 2.5)
+    axis_limit = np.ceil(data_extent + 0.5)
+    X_MIN, X_MAX = -axis_limit, axis_limit
+    Y_MIN, Y_MAX = -axis_limit, axis_limit
     def sx(v): return M["left"] + (v - X_MIN) / (X_MAX - X_MIN) * PW
     def sy(v): return M["top"] + (1 - (v - Y_MIN) / (Y_MAX - Y_MIN)) * PH
 
@@ -472,18 +855,26 @@ def create_zscore_scatter(z_scores, asset1, asset2, lookback=756):
     html = _svg_chart_base(chart_id, W, H, M, f"{asset1} vs {asset2} Z-Score",
         f"Current: {asset1}={curr_x:.2f}, {asset2}={curr_y:.2f} ({curr_date})")
 
-    # Grid lines
-    for v in [-3, -2, -1, 0, 1, 2, 3]:
+    # Grid lines — integer z-score levels within the dynamic range
+    for v in range(int(-axis_limit) + 1, int(axis_limit)):
+        if v == 0:
+            continue
         html += f'<line x1="{sx(X_MIN)}" x2="{sx(X_MAX)}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["gridLines"]}" stroke-width="0.5"/>'
         html += f'<line x1="{sx(v)}" x2="{sx(v)}" y1="{sy(Y_MIN)}" y2="{sy(Y_MAX)}" stroke="{COLORS["gridLines"]}" stroke-width="0.5"/>'
 
-    # Reference lines at ±1 and ±2
-    for v in [1, -1]:
-        html += f'<line x1="{sx(X_MIN)}" x2="{sx(X_MAX)}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textDim"]}" stroke-width="0.8" stroke-dasharray="4,4"/>'
-        html += f'<line x1="{sx(v)}" x2="{sx(v)}" y1="{sy(Y_MIN)}" y2="{sy(Y_MAX)}" stroke="{COLORS["textDim"]}" stroke-width="0.8" stroke-dasharray="4,4"/>'
-    for v in [2, -2]:
-        html += f'<line x1="{sx(X_MIN)}" x2="{sx(X_MAX)}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textMuted"]}" stroke-width="1" stroke-dasharray="2,2"/>'
-        html += f'<line x1="{sx(v)}" x2="{sx(v)}" y1="{sy(Y_MIN)}" y2="{sy(Y_MAX)}" stroke="{COLORS["textMuted"]}" stroke-width="1" stroke-dasharray="2,2"/>'
+    # Reference lines at ±1, ±2, ±3, ±4, ±5 (only if within range)
+    ref_styles = {
+        1: (COLORS["textDim"], "0.8", "4,4"),
+        2: (COLORS["textMuted"], "1", "2,2"),
+        3: (COLORS["orange"], "0.8", "3,3"),
+        4: (COLORS["red"], "0.8", "2,4"),
+        5: (COLORS["red"], "1", "1,2"),
+    }
+    for level, (color, width, dash) in ref_styles.items():
+        for v in [level, -level]:
+            if Y_MIN <= v <= Y_MAX:
+                html += f'<line x1="{sx(X_MIN)}" x2="{sx(X_MAX)}" y1="{sy(v)}" y2="{sy(v)}" stroke="{color}" stroke-width="{width}" stroke-dasharray="{dash}"/>'
+                html += f'<line x1="{sx(v)}" x2="{sx(v)}" y1="{sy(Y_MIN)}" y2="{sy(Y_MAX)}" stroke="{color}" stroke-width="{width}" stroke-dasharray="{dash}"/>'
 
     # Axes
     html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{M["top"]+PH}" y2="{M["top"]+PH}" stroke="#444"/>'
@@ -505,13 +896,13 @@ def create_zscore_scatter(z_scores, asset1, asset2, lookback=756):
     html += f'<polygon points="{cx-8},{cy} {cx},{cy-8} {cx+8},{cy} {cx},{cy+8}" fill="{COLORS["gold"]}" stroke="#000" stroke-width="1"/>'
     html += f'<text x="{cx+12}" y="{cy+4}" font-size="10" fill="{COLORS["gold"]}">Current</text>'
 
-    # X-axis ticks and labels
-    for v in [-4, -3, -2, -1, 0, 1, 2, 3, 4]:
+    # X-axis ticks and labels (dynamic range)
+    for v in range(int(-axis_limit), int(axis_limit) + 1):
         html += f'<line x1="{sx(v)}" x2="{sx(v)}" y1="{M["top"]+PH}" y2="{M["top"]+PH+5}" stroke="#444"/>'
         html += f'<text x="{sx(v)}" y="{M["top"]+PH+18}" text-anchor="middle" font-size="10" fill="{COLORS["textDim"]}">{v}</text>'
 
-    # Y-axis ticks and labels
-    for v in [-4, -3, -2, -1, 0, 1, 2, 3, 4]:
+    # Y-axis ticks and labels (dynamic range)
+    for v in range(int(-axis_limit), int(axis_limit) + 1):
         html += f'<line x1="{M["left"]-5}" x2="{M["left"]}" y1="{sy(v)}" y2="{sy(v)}" stroke="#444"/>'
         html += f'<text x="{M["left"]-10}" y="{sy(v)+3}" text-anchor="end" font-size="10" fill="{COLORS["textDim"]}">{v}</text>'
 
@@ -528,7 +919,7 @@ def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_window
     """Z-Score spread time series as HTML/SVG with dark theme and interactivity."""
     import json
     if ma_windows is None:
-        ma_windows = [20]  # Default to 20d MA
+        ma_windows = []  # Default: raw signal only (cumulative residuals are already smooth)
 
     recent = z_scores.iloc[-lookback:]
     spread = recent[asset1] - recent[asset2]
@@ -536,7 +927,7 @@ def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_window
     y_data = spread.values
     n_pts = len(y_data)
 
-    # Calculate smoothed moving averages for each window
+    # Calculate smoothed moving averages for each selected window
     spread_series = pd.Series(y_data)
     smoothed_lines = {}
     for window in ma_windows:
@@ -547,9 +938,9 @@ def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_window
     M = {"top": 30, "right": 40, "bottom": 50, "left": 55}
     PW, PH = W - M["left"] - M["right"], H - M["top"] - M["bottom"]
 
-    # Scale functions
-    y_min = max(-4, np.floor(y_data.min()) - 0.5)
-    y_max = min(4, np.ceil(y_data.max()) + 0.5)
+    # Scale functions — dynamic range, fits all data
+    y_min = np.floor(y_data.min()) - 0.5
+    y_max = np.ceil(y_data.max()) + 0.5
     def sx(i): return M["left"] + i / (n_pts - 1) * PW
     def sy(v): return M["top"] + (1 - (v - y_min) / (y_max - y_min)) * PH
 
@@ -558,11 +949,9 @@ def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_window
     curr_val = y_data[-1]
     curr_date = dates[-1].strftime('%d%b%y')
 
-    # Signal based on longest MA (most reliable)
-    longest_ma = max(ma_windows) if ma_windows else 20
-    smooth_curr = smoothed_lines.get(longest_ma, spread_series.rolling(window=20, min_periods=1).mean().values)[-1]
-    signal_color = COLORS["red"] if smooth_curr > 0 else COLORS["green"]
-    signal_text = "RICH" if smooth_curr > 0 else "CHEAP"
+    # Signal based on raw spread (cumulative residuals are already clean)
+    signal_color = COLORS["red"] if curr_val > 0 else COLORS["green"]
+    signal_text = "RICH" if curr_val > 0 else "CHEAP"
 
     # Generate unique chart ID
     chart_id = _generate_chart_id()
@@ -571,22 +960,30 @@ def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_window
     data_list = [{"x": float(i), "y": float(y_data[i]), "date": dates[i].strftime('%d%b%y')} for i in range(n_pts)]
     data_json = json.dumps(data_list)
 
-    # Build subtitle showing MA values
-    ma_str = " | ".join([f"{w}d: {smoothed_lines[w][-1]:+.2f}" for w in sorted(ma_windows)])
-    html = _svg_chart_base(chart_id, W, H, M, f"{asset1} - {asset2} Z-Score Spread",
-        f"<tspan fill='{signal_color}' font-weight='600'>{signal_text}</tspan> | {ma_str} | Raw: {curr_val:+.2f} ({curr_date})")
+    # Build subtitle
+    subtitle = f"<tspan fill='{signal_color}' font-weight='600'>{signal_text}</tspan>"
+    if ma_windows:
+        ma_str = " | ".join([f"{w}d: {smoothed_lines[w][-1]:+.2f}" for w in sorted(ma_windows)])
+        subtitle += f" | {ma_str}"
+    subtitle += f" | Raw: {curr_val:+.2f} ({curr_date})"
+    html = _svg_chart_base(chart_id, W, H, M, f"{asset1} - {asset2} Z-Score Spread", subtitle)
 
     # Grid lines
     for v in np.arange(np.ceil(y_min), np.floor(y_max) + 1, 1):
         html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["gridLines"]}" stroke-width="0.5"/>'
 
-    # Reference lines at ±1 and ±2
-    for v in [1, -1]:
-        if y_min <= v <= y_max:
-            html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textDim"]}" stroke-width="0.8" stroke-dasharray="4,4"/>'
-    for v in [2, -2]:
-        if y_min <= v <= y_max:
-            html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textMuted"]}" stroke-width="1" stroke-dasharray="2,2"/>'
+    # Reference lines at ±1, ±2, ±3, ±4, ±5
+    spread_ref_styles = {
+        1: (COLORS["textDim"], "0.8", "4,4"),
+        2: (COLORS["textMuted"], "1", "2,2"),
+        3: (COLORS["orange"], "0.8", "3,3"),
+        4: (COLORS["red"], "0.8", "2,4"),
+        5: (COLORS["red"], "1", "1,2"),
+    }
+    for level, (color, width, dash) in spread_ref_styles.items():
+        for v in [level, -level]:
+            if y_min <= v <= y_max:
+                html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{color}" stroke-width="{width}" stroke-dasharray="{dash}"/>'
 
     # Zero line
     if y_min <= 0 <= y_max:
@@ -596,9 +993,11 @@ def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_window
     html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{M["top"]+PH}" y2="{M["top"]+PH}" stroke="#444"/>'
     html += f'<line x1="{M["left"]}" x2="{M["left"]}" y1="{M["top"]}" y2="{M["top"]+PH}" stroke="#444"/>'
 
-    # Build path for raw line (thinner, more transparent)
+    # Raw line: primary when no MAs selected, faded background when MAs are overlaid
+    raw_width = "1.5" if not ma_windows else "0.8"
+    raw_opacity = "0.9" if not ma_windows else "0.4"
     path_d = " ".join([f"{'M' if i==0 else 'L'}{sx(i):.1f},{sy(y_data[i]):.1f}" for i in range(n_pts)])
-    html += f'<path d="{path_d}" fill="none" stroke="{COLORS["cyan"]}" stroke-width="0.8" opacity="0.4" clip-path="url(#{chart_id}_clip)"/>'
+    html += f'<path d="{path_d}" fill="none" stroke="{COLORS["cyan"]}" stroke-width="{raw_width}" opacity="{raw_opacity}" clip-path="url(#{chart_id}_clip)"/>'
 
     # MA line colors
     ma_colors = {5: COLORS["green"], 10: COLORS["orange"], 20: COLORS["purple"]}
@@ -621,8 +1020,11 @@ def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_window
         html += f'<text x="{legend_x+20}" y="{legend_y+3}" font-size="9" fill="{COLORS["textMuted"]}">{window}d</text>'
         legend_y += 12
 
-    # Current point marker (on longest MA line)
-    longest_smoothed = smoothed_lines[max(ma_windows)] if ma_windows else y_data
+    # Current point marker (on longest MA line if any, otherwise raw)
+    if ma_windows:
+        longest_smoothed = smoothed_lines[max(ma_windows)]
+    else:
+        longest_smoothed = y_data
     cx, cy = sx(n_pts-1), sy(longest_smoothed[-1])
     html += f'<circle cx="{cx}" cy="{cy}" r="4" fill="{COLORS["gold"]}" stroke="#000" stroke-width="1"/>'
 
@@ -766,6 +1168,11 @@ def fit_sigmoid(x_data, y_data):
     """
     Fit sigmoid curve with data-driven constraints.
     Works for any asset pair (equity vs credit, credit vs credit, etc.)
+
+    Key insight: the sign of k determines the sigmoid direction:
+      k > 0 = DECREASING sigmoid (e.g. SPX deviation vs CDX IG - negative correlation)
+      k < 0 = INCREASING sigmoid (e.g. CDX IG vs CDX HY - positive correlation)
+    We detect the correlation direction and use the appropriate sign.
     """
     # Calculate data-driven bounds
     x_min, x_max = np.min(x_data), np.max(x_data)
@@ -782,9 +1189,15 @@ def fit_sigmoid(x_data, y_data):
     # Midpoint bounds based on X data range
     mid_min, mid_max = x_min - 0.2 * x_range, x_max + 0.2 * x_range
 
-    # Steepness bounds (scale with data)
+    # Steepness bounds - allow both positive AND negative k
+    # Positive k = decreasing sigmoid (equity vs credit)
+    # Negative k = increasing sigmoid (credit vs credit, or any positive correlation)
     k_scale = 1.0 / max(x_range, 1)  # Normalize by x range
-    k_min, k_max = 0.01 * k_scale, 5.0 * k_scale
+    k_mag_min = 0.01 * k_scale   # Minimum absolute steepness
+    k_mag_max = 5.0 * k_scale    # Maximum absolute steepness
+
+    # Detect relationship direction to choose starting k sign
+    correlation = np.corrcoef(x_data, y_data)[0, 1]
 
     def cost(params):
         floor, ceiling, k, midpoint = params
@@ -795,24 +1208,30 @@ def fit_sigmoid(x_data, y_data):
             return 1e15
         if ceiling - floor < min_range:
             return 1e15
-        if k < k_min or k > k_max:
+        if abs(k) < k_mag_min or abs(k) > k_mag_max:
             return 1e15
         if midpoint < mid_min or midpoint > mid_max:
             return 1e15
         return np.sum((sigmoid_val(x_data, params) - y_data) ** 2)
 
-    # Generate data-driven starting points
+    # Generate data-driven starting points with correct k sign
     floor_start = y_min + 0.1 * y_range
     ceil_start = y_max - 0.1 * y_range
-    k_start = 0.5 * k_scale
     mid_start = x_mean
 
+    if correlation > 0:
+        # Positive correlation (e.g. CDX IG vs CDX HY) → increasing sigmoid → negative k
+        k_signs = [-0.3, -0.5, -1.0, -1.5, -2.0]
+    else:
+        # Negative correlation (e.g. SPX vs CDX IG) → decreasing sigmoid → positive k
+        k_signs = [0.3, 0.5, 1.0, 1.5, 2.0]
+
     starts = [
-        [floor_start, ceil_start, k_start, mid_start],
-        [floor_start * 0.95, ceil_start * 1.05, k_start * 0.5, mid_start - 0.1 * x_range],
-        [floor_start * 1.05, ceil_start * 0.95, k_start * 1.5, mid_start + 0.1 * x_range],
-        [floor_start, ceil_start, k_start * 2, mid_start],
-        [floor_start * 0.9, ceil_start * 1.1, k_start * 0.3, mid_start],
+        [floor_start, ceil_start, k_signs[1] * k_scale, mid_start],
+        [floor_start * 0.95, ceil_start * 1.05, k_signs[0] * k_scale, mid_start - 0.1 * x_range],
+        [floor_start * 1.05, ceil_start * 0.95, k_signs[2] * k_scale, mid_start + 0.1 * x_range],
+        [floor_start, ceil_start, k_signs[3] * k_scale, mid_start],
+        [floor_start * 0.9, ceil_start * 1.1, k_signs[4] * k_scale, mid_start],
     ]
 
     best_result, best_cost = None, 1e15
@@ -825,8 +1244,8 @@ def fit_sigmoid(x_data, y_data):
             continue
 
     if best_result is None:
-        # Fallback to simple linear approximation
-        best_result = [floor_start, ceil_start, k_start, mid_start]
+        # Fallback
+        best_result = [floor_start, ceil_start, k_signs[1] * k_scale, mid_start]
 
     return {"floor": best_result[0], "ceiling": best_result[1], "steepness": best_result[2], "midpoint": best_result[3]}
 
@@ -1086,6 +1505,7 @@ class AppState:
     def __init__(self):
         self.raw_data = None
         self.returns = None
+        self.calendar_audit = None
         self.pca_results = None
         self.test_results = None
         self.suggested_cohorts = None
@@ -1132,6 +1552,8 @@ cohort_output = widgets.Output()
 num_pcs = widgets.IntSlider(value=1, min=1, max=5, description="PCs:")
 zscore_window = widgets.IntSlider(value=60, min=20, max=252, step=5, description="Z Window:",
                                    style={'description_width': '70px'}, layout=widgets.Layout(width="250px"))
+winsor_cap_slider = widgets.FloatSlider(value=3.0, min=0, max=6, step=0.5, description="Winsor Cap:",
+                                         style={'description_width': '75px'}, layout=widgets.Layout(width="250px"))
 run_pca_btn = widgets.Button(description="Run PCA", button_style="primary")
 pca_output = widgets.Output()
 results_output = widgets.Output()
@@ -1185,7 +1607,7 @@ regime_floor = widgets.FloatSlider(value=48, min=38, max=60, step=0.5, descripti
                                     style={'description_width': '40px'}, layout=widgets.Layout(width="140px"))
 regime_ceiling = widgets.FloatSlider(value=170, min=100, max=300, step=5, description="Ceil:",
                                       style={'description_width': '40px'}, layout=widgets.Layout(width="140px"))
-regime_steep = widgets.FloatSlider(value=0.15, min=0.05, max=0.5, step=0.01, description="K:",
+regime_steep = widgets.FloatSlider(value=0.15, min=-0.5, max=0.5, step=0.01, description="K:",
                                     style={'description_width': '20px'}, layout=widgets.Layout(width="130px"))
 regime_mid = widgets.FloatSlider(value=-12, min=-25, max=0, step=0.5, description="Mid:",
                                   style={'description_width': '30px'}, layout=widgets.Layout(width="130px"))
@@ -1248,13 +1670,28 @@ def on_load(b):
         if check_roll_date_reminder():
             display(HTML("<div style='background:#fff3cd;padding:10px;border-radius:5px;margin-bottom:10px;'><b>⚠️ REMINDER:</b> Update ROLL_DATES list!</div>"))
         state.raw_data = load_data_bql(state.selected_assets, state.field_map, start_date.value.strftime("%Y-%m-%d"), end_date.value.strftime("%Y-%m-%d"))
-        roll_dates = get_all_roll_dates()
-        dates_to_remove = state.raw_data.index.intersection(roll_dates)
-        if len(dates_to_remove) > 0:
-            state.raw_data = state.raw_data.drop(dates_to_remove)
-            print(f"Removed {len(dates_to_remove)} roll dates")
+        # Compute returns FIRST on full price data, THEN remove discontinuity dates
+        # Old approach: dropping roll dates from raw prices caused pct_change() to span
+        # the series gap (old series → new series = artificial multi-day return)
+        # New approach: pct_change() on full data isolates the artificial return to the
+        # roll date itself, then we surgically remove just that one-day artificial return
         state.returns = state.raw_data.pct_change().dropna()
         state.returns = state.returns.replace([np.inf, -np.inf], np.nan).dropna()
+        discontinuity_dates = get_all_discontinuity_dates()
+        dates_to_remove = state.returns.index.intersection(discontinuity_dates)
+        if len(dates_to_remove) > 0:
+            state.returns = state.returns.drop(dates_to_remove)
+            print(f"Removed {len(dates_to_remove)} roll/recon date returns")
+        start_yr = start_date.value.year
+        end_yr = end_date.value.year
+        state.returns, audit, n_db, n_stale = filter_calendar_misalignment(
+            state.returns, state.selected_assets, start_yr, end_yr
+        )
+        state.calendar_audit = audit
+        print(f"Calendar filter: {n_db} known holidays + {n_stale} detected stale = {n_db + n_stale} days removed")
+        if len(audit) > 0:
+            for _, row in audit.head(5).iterrows():
+                print(f"  {row['Date'].strftime('%Y-%m-%d')} ({row['Day of Week'][:3]}) - {row['Rule']} [{row['Filter Source']}]")
         print(f"Loaded {len(state.returns)} days for {len(state.selected_assets)} assets")
         # Update Z-Score pair dropdowns
         pair_asset1.options = state.selected_assets
@@ -1302,7 +1739,7 @@ def on_run_pca(b):
         if state.returns is None:
             print("Load data first")
             return
-        state.pca_results = run_pca_analysis(state.returns, num_pcs=num_pcs.value, zscore_window=zscore_window.value)
+        state.pca_results = run_pca_analysis(state.returns, num_pcs=num_pcs.value, zscore_window=zscore_window.value, winsor_cap=winsor_cap_slider.value)
         var = state.pca_results["variance"]
         print(f"PC1: {var.iloc[0]:.1%} | PC2: {var.iloc[1]:.1%} | PC3: {var.iloc[2]:.1%}")
     with results_output:
@@ -1334,10 +1771,7 @@ def on_zscore_update(b):
             ma_windows.append(10)
         if zscore_ma_20d.value:
             ma_windows.append(20)
-        if not ma_windows:
-            ma_windows = [20]  # Default if none selected
-
-        # Display HTML/SVG charts
+        # Display HTML/SVG charts (empty list = raw only, no MA overlay)
         display(HTML(create_zscore_scatter(z, a1, a2)))
         display(HTML(create_zscore_spread_chart(z, a1, a2, ma_windows=ma_windows)))
 
@@ -1372,7 +1806,7 @@ def on_regime_load(b):
         ceil_min_new = y_max - 0.5 * y_range
         ceil_max_new = y_max + 0.2 * y_range
         k_scale = 1.0 / max(x_range, 1)
-        steep_min_new = 0.01 * k_scale
+        steep_min_new = -5.0 * k_scale
         steep_max_new = 5.0 * k_scale
         mid_min_new = x_min - 0.3 * x_range
         mid_max_new = x_max + 0.3 * x_range
@@ -1391,8 +1825,8 @@ def on_regime_load(b):
         regime_ceiling.max = ceil_max_new
         regime_ceiling.step = max(y_range / 100, 0.1)
 
-        regime_steep.min = min(steep_min_new, regime_steep.min, 0.001)
-        regime_steep.max = max(steep_max_new, regime_steep.max, 10)
+        regime_steep.min = min(steep_min_new, regime_steep.min)
+        regime_steep.max = max(steep_max_new, regime_steep.max)
         regime_steep.min = steep_min_new
         regime_steep.max = steep_max_new
         regime_steep.step = max(0.1 * k_scale, 0.001)
@@ -1546,7 +1980,7 @@ tab2 = widgets.VBox([
 
 tab3 = widgets.VBox([
     widgets.HTML("<h3>PCA Analysis</h3>"),
-    widgets.HBox([num_pcs, zscore_window]),
+    widgets.HBox([num_pcs, zscore_window, winsor_cap_slider]),
     run_pca_btn, pca_output,
     widgets.HTML("<h4>Rankings</h4>"), results_output
 ])
