@@ -564,7 +564,7 @@ def run_validation_tests(returns):
     results["Clustering"] = {"value": n_clusters, "status": "PASS" if 2 <= n_clusters <= 4 else "WARN"}
     return results
 
-def run_pca_analysis(returns, num_pcs=1, zscore_window=60, winsor_cap=3.0):
+def run_pca_analysis(returns, num_pcs=1, zscore_window=60):
     credit = [a for a in returns.columns if a in CREDIT_ASSETS]
     equity = [a for a in returns.columns if a in EQUITY_ASSETS]
     returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
@@ -580,32 +580,21 @@ def run_pca_analysis(returns, num_pcs=1, zscore_window=60, winsor_cap=3.0):
         expected += np.outer(pca_scores[:, i], beta)
     residuals = data_scaled - expected
 
-    # Winsorize extreme daily residuals before cumsumming
-    # Without this, a single extreme day (FOMC, surprise event) injects an outsized
-    # value into cumsum that permanently distorts the cumulative residual level.
-    # winsor_cap=0 disables winsorization (no clipping)
-    if winsor_cap > 0:
-        residual_std = np.std(residuals, axis=0, keepdims=True)
-        residual_std = np.where(residual_std < 1e-10, 1.0, residual_std)  # safety floor
-        residual_clip = winsor_cap * residual_std
-        residuals = np.clip(residuals, -residual_clip, residual_clip)
+    # EWM accumulation of daily residuals over the z-score window
+    # Exponential weighting: recent residuals matter most, older ones fade gradually
+    # Half-life ~20 days (for span=60): signal builds over ~3 weeks of persistent
+    # richness, decays at the same rate when the pattern reverses
+    # No cliff effect (unlike rolling window) and weekend-proof (smooth decay)
+    residuals_df = pd.DataFrame(residuals, index=returns.index, columns=returns.columns)
+    signal = residuals_df.ewm(span=zscore_window).mean()
 
-    # Cumulate daily residuals into mispricing levels
-    # Each day's residual = how much the asset's return deviated from PC expectation
-    # Summing over time: persistent deviations compound, random noise cancels out
-    cumulative_residuals = pd.DataFrame(
-        np.cumsum(residuals, axis=0),
-        index=returns.index,
-        columns=returns.columns
-    )
-
-    # Exponentially weighted z-score of cumulative residuals
-    # EWM avoids the "cliff effect" of rolling windows: old observations fade gradually
-    # instead of dropping off suddenly, so z-scores don't jump overnight when nothing moved
-    # span parameter gives similar effective lookback to a rolling window but smooth
-    ewm_mean = cumulative_residuals.ewm(span=zscore_window).mean()
-    ewm_std = cumulative_residuals.ewm(span=zscore_window).std()
-    z_scores = (cumulative_residuals - ewm_mean) / ewm_std
+    # Expanding window z-score: uses full history (from day 252 onward)
+    # "Is this signal level unusual relative to ALL history?"
+    # Thresholds stabilize over time — after 2+ years, ±2 always means the same thing
+    # No sensitivity to "recent tight baseline" that can inflate z-scores
+    expanding_mean = signal.expanding(min_periods=252).mean()
+    expanding_std = signal.expanding(min_periods=252).std()
+    z_scores = (signal - expanding_mean) / expanding_std
     z_scores = z_scores.dropna()
 
     # FLIP credit z-scores so that POSITIVE = RICH for ALL assets
@@ -728,12 +717,12 @@ def _svg_interactive_layer(chart_id, width, height, margin, x_min, x_max, y_min,
           stroke="#555" stroke-width="1" stroke-dasharray="3,3" visibility="hidden"/>
     <line id="{chart_id}_hline" x1="{margin['left']}" x2="{margin['left']+PW}" y1="0" y2="0"
           stroke="{COLORS['purple']}" stroke-width="1" stroke-dasharray="3,3" opacity="0.6" visibility="hidden"/>
-    <circle id="{chart_id}_hover_dot" cx="0" cy="0" r="5" fill="{COLORS['purple']}" stroke="#fff" stroke-width="1.5" visibility="hidden"/>
+    <circle id="{chart_id}_hover_dot" cx="0" cy="0" r="3" fill="{COLORS['purple']}" stroke="#fff" stroke-width="1" visibility="hidden"/>
     <g id="{chart_id}_tooltip" visibility="hidden">
-        <rect x="0" y="0" width="130" height="55" rx="4" fill="#181825" stroke="#333" opacity="0.95"/>
-        <text id="{chart_id}_tt_x" x="8" y="18" font-size="11" fill="{COLORS['textMuted']}">{x_label}: <tspan id="{chart_id}_tt_xval" fill="#fff">0</tspan></text>
-        <text id="{chart_id}_tt_y" x="8" y="36" font-size="11" fill="{COLORS['textMuted']}">{y_label}: <tspan id="{chart_id}_tt_yval" fill="{COLORS['purple']}">0</tspan></text>
-        <text id="{chart_id}_tt_date" x="8" y="50" font-size="10" fill="{COLORS['textDim']}"></text>
+        <rect x="0" y="0" width="115" height="46" rx="3" fill="#181825" stroke="#333" opacity="0.95"/>
+        <text id="{chart_id}_tt_x" x="6" y="15" font-size="10" fill="{COLORS['textMuted']}">{x_label}: <tspan id="{chart_id}_tt_xval" fill="#fff">0</tspan></text>
+        <text id="{chart_id}_tt_y" x="6" y="30" font-size="10" fill="{COLORS['textMuted']}">{y_label}: <tspan id="{chart_id}_tt_yval" fill="{COLORS['purple']}">0</tspan></text>
+        <text id="{chart_id}_tt_date" x="6" y="42" font-size="9" fill="{COLORS['textDim']}"></text>
     </g>
     <rect id="{chart_id}_overlay" x="{margin['left']}" y="{margin['top']}" width="{PW}" height="{PH}"
           fill="transparent" style="pointer-events:all;"/>
@@ -832,8 +821,8 @@ def create_zscore_scatter(z_scores, asset1, asset2, lookback=756):
     n_pts = len(x_data)
 
     # Chart dimensions
-    W, H = 700, 380
-    M = {"top": 30, "right": 40, "bottom": 50, "left": 55}
+    W, H = 650, 280
+    M = {"top": 25, "right": 35, "bottom": 40, "left": 50}
     PW, PH = W - M["left"] - M["right"], H - M["top"] - M["bottom"]
 
     # Dynamic axis range — fits all data points with padding
@@ -918,27 +907,18 @@ def create_zscore_scatter(z_scores, asset1, asset2, lookback=756):
 
     return html
 
-def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_windows=None):
+def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756):
     """Z-Score spread time series as HTML/SVG with dark theme and interactivity."""
     import json
-    if ma_windows is None:
-        ma_windows = []  # Default: raw signal only (cumulative residuals are already smooth)
-
     recent = z_scores.iloc[-lookback:]
     spread = recent[asset1] - recent[asset2]
     dates = recent.index.tolist()
     y_data = spread.values
     n_pts = len(y_data)
 
-    # Calculate smoothed moving averages for each selected window
-    spread_series = pd.Series(y_data)
-    smoothed_lines = {}
-    for window in ma_windows:
-        smoothed_lines[window] = spread_series.rolling(window=window, min_periods=1).mean().values
-
     # Chart dimensions
-    W, H = 700, 300
-    M = {"top": 30, "right": 40, "bottom": 50, "left": 55}
+    W, H = 650, 220
+    M = {"top": 25, "right": 35, "bottom": 40, "left": 50}
     PW, PH = W - M["left"] - M["right"], H - M["top"] - M["bottom"]
 
     # Scale functions — dynamic range, fits all data
@@ -947,46 +927,26 @@ def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_window
     def sx(i): return M["left"] + i / (n_pts - 1) * PW
     def sy(v): return M["top"] + (1 - (v - y_min) / (y_max - y_min)) * PH
 
-    # Stats
-    hi_idx, lo_idx = np.argmax(y_data), np.argmin(y_data)
     curr_val = y_data[-1]
     curr_date = dates[-1].strftime('%d%b%y')
-
-    # Signal based on raw spread (cumulative residuals are already clean)
     signal_color = COLORS["red"] if curr_val > 0 else COLORS["green"]
     signal_text = "RICH" if curr_val > 0 else "CHEAP"
 
-    # Generate unique chart ID
     chart_id = _generate_chart_id()
 
-    # Build data JSON for interactivity (use index as x for time series)
     data_list = [{"x": float(i), "y": float(y_data[i]), "date": dates[i].strftime('%d%b%y')} for i in range(n_pts)]
     data_json = json.dumps(data_list)
 
-    # Build subtitle
-    subtitle = f"<tspan fill='{signal_color}' font-weight='600'>{signal_text}</tspan>"
-    if ma_windows:
-        ma_str = " | ".join([f"{w}d: {smoothed_lines[w][-1]:+.2f}" for w in sorted(ma_windows)])
-        subtitle += f" | {ma_str}"
-    subtitle += f" | Raw: {curr_val:+.2f} ({curr_date})"
+    subtitle = f"<tspan fill='{signal_color}' font-weight='600'>{signal_text}</tspan> | {curr_val:+.2f} ({curr_date})"
     html = _svg_chart_base(chart_id, W, H, M, f"{asset1} - {asset2} Z-Score Spread", subtitle)
 
-    # Grid lines
-    for v in np.arange(np.ceil(y_min), np.floor(y_max) + 1, 1):
-        html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["gridLines"]}" stroke-width="0.5"/>'
-
-    # Reference lines at ±1, ±2, ±3, ±4, ±5
-    spread_ref_styles = {
-        1: (COLORS["textDim"], "0.8", "4,4"),
-        2: (COLORS["textMuted"], "1", "2,2"),
-        3: (COLORS["orange"], "0.8", "3,3"),
-        4: (COLORS["red"], "0.8", "2,4"),
-        5: (COLORS["red"], "1", "1,2"),
-    }
-    for level, (color, width, dash) in spread_ref_styles.items():
-        for v in [level, -level]:
-            if y_min <= v <= y_max:
-                html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{color}" stroke-width="{width}" stroke-dasharray="{dash}"/>'
+    # Reference lines at ±1 and ±2 only
+    for v in [1, -1]:
+        if y_min <= v <= y_max:
+            html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textDim"]}" stroke-width="0.8" stroke-dasharray="4,4"/>'
+    for v in [2, -2]:
+        if y_min <= v <= y_max:
+            html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{sy(v)}" y2="{sy(v)}" stroke="{COLORS["textMuted"]}" stroke-width="1" stroke-dasharray="2,2"/>'
 
     # Zero line
     if y_min <= 0 <= y_max:
@@ -996,39 +956,12 @@ def create_zscore_spread_chart(z_scores, asset1, asset2, lookback=756, ma_window
     html += f'<line x1="{M["left"]}" x2="{M["left"]+PW}" y1="{M["top"]+PH}" y2="{M["top"]+PH}" stroke="#444"/>'
     html += f'<line x1="{M["left"]}" x2="{M["left"]}" y1="{M["top"]}" y2="{M["top"]+PH}" stroke="#444"/>'
 
-    # Raw line: primary when no MAs selected, faded background when MAs are overlaid
-    raw_width = "1.5" if not ma_windows else "0.8"
-    raw_opacity = "0.9" if not ma_windows else "0.4"
+    # Spread line
     path_d = " ".join([f"{'M' if i==0 else 'L'}{sx(i):.1f},{sy(y_data[i]):.1f}" for i in range(n_pts)])
-    html += f'<path d="{path_d}" fill="none" stroke="{COLORS["cyan"]}" stroke-width="{raw_width}" opacity="{raw_opacity}" clip-path="url(#{chart_id}_clip)"/>'
+    html += f'<path d="{path_d}" fill="none" stroke="{COLORS["cyan"]}" stroke-width="1.5" clip-path="url(#{chart_id}_clip)"/>'
 
-    # MA line colors
-    ma_colors = {5: COLORS["green"], 10: COLORS["orange"], 20: COLORS["purple"]}
-
-    # Build paths for each MA line
-    for window in sorted(ma_windows):
-        smoothed = smoothed_lines[window]
-        color = ma_colors.get(window, COLORS["purple"])
-        smooth_path_d = " ".join([f"{'M' if i==0 else 'L'}{sx(i):.1f},{sy(smoothed[i]):.1f}" for i in range(n_pts)])
-        html += f'<path d="{smooth_path_d}" fill="none" stroke="{color}" stroke-width="1.5" clip-path="url(#{chart_id}_clip)"/>'
-
-    # Legend
-    legend_x, legend_y = W - 100, M["top"] + 10
-    html += f'<line x1="{legend_x}" x2="{legend_x+15}" y1="{legend_y}" y2="{legend_y}" stroke="{COLORS["cyan"]}" stroke-width="1" opacity="0.5"/>'
-    html += f'<text x="{legend_x+20}" y="{legend_y+3}" font-size="9" fill="{COLORS["textDim"]}">Raw</text>'
-    legend_y += 12
-    for window in sorted(ma_windows):
-        color = ma_colors.get(window, COLORS["purple"])
-        html += f'<line x1="{legend_x}" x2="{legend_x+15}" y1="{legend_y}" y2="{legend_y}" stroke="{color}" stroke-width="1.5"/>'
-        html += f'<text x="{legend_x+20}" y="{legend_y+3}" font-size="9" fill="{COLORS["textMuted"]}">{window}d</text>'
-        legend_y += 12
-
-    # Current point marker (on longest MA line if any, otherwise raw)
-    if ma_windows:
-        longest_smoothed = smoothed_lines[max(ma_windows)]
-    else:
-        longest_smoothed = y_data
-    cx, cy = sx(n_pts-1), sy(longest_smoothed[-1])
+    # Current point marker
+    cx, cy = sx(n_pts-1), sy(y_data[-1])
     html += f'<circle cx="{cx}" cy="{cy}" r="4" fill="{COLORS["gold"]}" stroke="#000" stroke-width="1"/>'
 
     # X-axis labels (show ~6 dates)
@@ -1089,8 +1022,8 @@ def create_zscore_legs_chart(z_scores, asset1, asset2, show_mode="Both", lookbac
     n_pts = len(dates)
 
     # Chart dimensions
-    W, H = 700, 280
-    M = {"top": 30, "right": 40, "bottom": 50, "left": 55}
+    W, H = 650, 200
+    M = {"top": 25, "right": 35, "bottom": 40, "left": 50}
     PW, PH = W - M["left"] - M["right"], H - M["top"] - M["bottom"]
 
     # Fixed ±4 y-axis to match scatter chart
@@ -1647,11 +1580,10 @@ cohort_output = widgets.Output()
 # TAB 3: PCA WIDGETS
 # ============================================================================
 
-num_pcs = widgets.IntSlider(value=1, min=1, max=5, description="PCs:")
-zscore_window = widgets.IntSlider(value=60, min=20, max=252, step=5, description="Z Window:",
-                                   style={'description_width': '70px'}, layout=widgets.Layout(width="250px"))
-winsor_cap_slider = widgets.FloatSlider(value=3.0, min=0, max=6, step=0.5, description="Winsor Cap:",
-                                         style={'description_width': '75px'}, layout=widgets.Layout(width="250px"))
+num_pcs = widgets.BoundedIntText(value=1, min=1, max=5, description="PCs:",
+                                  layout=widgets.Layout(width="120px"))
+zscore_window = widgets.BoundedIntText(value=60, min=20, max=252, step=5, description="Z Window:",
+                                        style={'description_width': '70px'}, layout=widgets.Layout(width="180px"))
 run_pca_btn = widgets.Button(description="Run PCA", button_style="primary")
 pca_output = widgets.Output()
 results_output = widgets.Output()
@@ -1666,10 +1598,6 @@ pair_asset1 = widgets.Dropdown(options=[], description="Asset 1:", layout=widget
 pair_asset2 = widgets.Dropdown(options=[], description="Asset 2:", layout=widgets.Layout(width="160px"),
                                 style={'description_width': '55px'})
 zscore_btn = widgets.Button(description="Update", button_style="info", layout=widgets.Layout(width="70px"))
-# MA selection for Z-Score spread chart
-zscore_ma_5d = widgets.Checkbox(value=False, description="5d", indent=False, layout=widgets.Layout(width="50px"))
-zscore_ma_10d = widgets.Checkbox(value=False, description="10d", indent=False, layout=widgets.Layout(width="55px"))
-zscore_ma_20d = widgets.Checkbox(value=True, description="20d", indent=False, layout=widgets.Layout(width="55px"))
 zscore_output = widgets.Output()
 # Individual legs chart
 legs_dropdown = widgets.Dropdown(options=["Both"], value="Both", description="Leg:",
@@ -1848,7 +1776,7 @@ def on_run_pca(b):
         if state.returns is None:
             print("Load data first")
             return
-        state.pca_results = run_pca_analysis(state.returns, num_pcs=num_pcs.value, zscore_window=zscore_window.value, winsor_cap=winsor_cap_slider.value)
+        state.pca_results = run_pca_analysis(state.returns, num_pcs=num_pcs.value, zscore_window=zscore_window.value)
         var = state.pca_results["variance"]
         print(f"PC1: {var.iloc[0]:.1%} | PC2: {var.iloc[1]:.1%} | PC3: {var.iloc[2]:.1%}")
     with results_output:
@@ -1901,17 +1829,8 @@ def on_zscore_update(b):
     update_legs_chart()
 
     # Spread chart
-    ma_windows = []
-    if zscore_ma_5d.value:
-        ma_windows.append(5)
-    if zscore_ma_10d.value:
-        ma_windows.append(10)
-    if zscore_ma_20d.value:
-        ma_windows.append(20)
-    if not ma_windows:
-        ma_windows = [20]
     with zscore_spread_output:
-        display(HTML(create_zscore_spread_chart(z, a1, a2, ma_windows=ma_windows)))
+        display(HTML(create_zscore_spread_chart(z, a1, a2)))
 
 def on_regime_load(b):
     with regime_load_output:
@@ -2111,15 +2030,27 @@ tab1 = widgets.VBox([
     load_btn, data_output
 ])
 
+validation_explainer = widgets.HTML("""
+<div style='background:#f8f9fa;border:1px solid #ddd;border-radius:6px;padding:10px;margin-top:10px;font-size:11px;line-height:1.5;'>
+<b>What each test means:</b><br>
+<b>KMO</b> — Kaiser-Meyer-Olkin: Measures whether your assets share enough common variance for PCA to work. >0.6 = good, >0.8 = excellent. Low KMO means assets move too independently.<br>
+<b>Correlation</b> — Average pairwise correlation: How tightly your assets move together on average. Higher = PCA will capture more of the total picture in fewer components.<br>
+<b>Stability</b> — Loading stability: Checks whether PCA loadings are consistent across time (first half vs second half of history). Low stability means the relationships between assets are shifting, making signals less reliable.<br>
+<b>LeadLag</b> — Lead-lag test: Detects if one asset systematically leads or lags others. Strong lead-lag effects mean PCA residuals may reflect delayed reactions rather than genuine rich/cheap signals.<br>
+<b>Clustering</b> — Asset clustering: Groups assets by how similarly they behave. Ideally credit and equity form distinct clusters. If all assets land in one cluster, the cohort may lack enough diversity for meaningful relative value.
+</div>
+""")
+
 tab2 = widgets.VBox([
     widgets.HTML("<h3>Validation</h3>"),
     run_tests_btn, tests_output, widgets.HTML("<br>"),
-    suggest_btn, cohort_output
+    suggest_btn, cohort_output,
+    validation_explainer
 ])
 
 tab3 = widgets.VBox([
     widgets.HTML("<h3>PCA Analysis</h3>"),
-    widgets.HBox([num_pcs, zscore_window, winsor_cap_slider]),
+    widgets.HBox([num_pcs, zscore_window]),
     run_pca_btn, pca_output,
     widgets.HTML("<h4>Rankings</h4>"), results_output
 ])
@@ -2129,9 +2060,7 @@ tab4 = widgets.VBox([
     widgets.HTML("<h3>Charts</h3>"),
     # Z-Score Section
     widgets.HTML("<b style='font-size:11px;'>Z-Score Analysis</b>"),
-    widgets.HBox([pair_asset1, pair_asset2, zscore_btn,
-                  widgets.HTML("<span style='font-size:9px;color:#888;margin:0 8px;'>MA:</span>"),
-                  zscore_ma_5d, zscore_ma_10d, zscore_ma_20d],
+    widgets.HBox([pair_asset1, pair_asset2, zscore_btn],
                  layout=widgets.Layout(align_items="center")),
     zscore_output,
     widgets.HBox([legs_dropdown], layout=widgets.Layout(margin="4px 0")),
